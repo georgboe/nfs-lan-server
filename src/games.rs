@@ -464,11 +464,18 @@ impl Lobby {
     }
 
     fn stats(&self) -> Stats {
-        let logged_in = self.players.iter().filter(|(_, p)| !p.persona.is_empty());
-        let users_in_games = logged_in.clone().filter(|(id, _)| self.game_of(**id).is_some()).count();
+        let logged_in = self.players.values().filter(|p| !p.persona.is_empty()).count();
+        // A client is in at most one game, so counting each game's logged-in
+        // members counts every player in a game once.
+        let users_in_games = self
+            .games
+            .values()
+            .flat_map(|g| &g.players)
+            .filter(|id| self.players.get(id).is_some_and(|p| !p.persona.is_empty()))
+            .count();
         let games_in_progress = self.games.values().filter(|g| g.started).count();
         Stats {
-            users_in_lobby: logged_in.count() - users_in_games,
+            users_in_lobby: logged_in - users_in_games,
             users_in_games,
             games_in_progress,
             games_unstarted: self.games.len() - games_in_progress,
@@ -1313,5 +1320,291 @@ mod tests {
         let (mut lobby, ids) = lobby_with(&["a"]);
         let out = lobby.handle(ids[0], &msg(b"gjoi", "NAME=nope")).unwrap();
         assert_eq!(&out[0].data[4..8], b"nfnd");
+    }
+
+    // The tests below pin down the lobby's bookkeeping (stats, game
+    // membership, browser lists) so it can be reworked for speed.
+
+    /// (users_in_lobby, users_in_games, games_in_progress, games_unstarted),
+    /// counted from scratch from the games and players.
+    fn recount(lobby: &Lobby) -> (usize, usize, usize, usize) {
+        let logged_in: Vec<ClientId> =
+            lobby.players.iter().filter(|(_, p)| !p.persona.is_empty()).map(|(id, _)| *id).collect();
+        let in_game = logged_in.iter().filter(|id| lobby.games.values().any(|g| g.players.contains(id))).count();
+        let started = lobby.games.values().filter(|g| g.started).count();
+        (logged_in.len() - in_game, in_game, started, lobby.games.len() - started)
+    }
+
+    fn stats_tuple(lobby: &Lobby) -> (usize, usize, usize, usize) {
+        let s = lobby.stats();
+        (s.users_in_lobby, s.users_in_games, s.games_in_progress, s.games_unstarted)
+    }
+
+    #[test]
+    fn stats_count_every_state_with_many_players_and_games() {
+        let names: Vec<String> = (0..40).map(|i| format!("p{i}")).collect();
+        let (mut lobby, ids) = lobby_with(&names.iter().map(String::as_str).collect::<Vec<_>>());
+        // Players 0..8 host g0..g7; players 8..32 join three per game; 32..40 idle.
+        for k in 0..8 {
+            lobby.handle(ids[k], &msg(b"gcre", &format!("NAME=g{k}\nMINSIZE=2\nMAXSIZE=8"))).unwrap();
+            for j in 0..3 {
+                let out = lobby.handle(ids[8 + 3 * k + j], &msg(b"gjoi", &format!("NAME=g{k}"))).unwrap();
+                assert_eq!(&out[0].data[4..8], &[0; 4]);
+            }
+        }
+        for k in 0..4 {
+            let out = lobby.handle(ids[k], &msg(b"gsta", &format!("NAME=g{k}"))).unwrap();
+            assert_eq!(&out[0].data[4..8], &[0; 4]);
+        }
+        assert_eq!(stats_tuple(&lobby), (8, 32, 4, 4));
+        assert_eq!(stats_tuple(&lobby), recount(&lobby));
+
+        // An idle player joins a game.
+        lobby.handle(ids[32], &msg(b"gjoi", "NAME=g7")).unwrap();
+        assert_eq!(stats_tuple(&lobby), (7, 33, 4, 4));
+
+        // A started game can't be joined; nothing changes.
+        let out = lobby.handle(ids[33], &msg(b"gjoi", "NAME=g1")).unwrap();
+        assert_eq!(&out[0].data[4..8], b"asta");
+        assert_eq!(stats_tuple(&lobby), (7, 33, 4, 4));
+
+        // A guest moves from g4 to g5: still in a game, g4 survives.
+        lobby.handle(ids[20], &msg(b"gjoi", "NAME=g5")).unwrap();
+        assert_eq!(stats_tuple(&lobby), (7, 33, 4, 4));
+
+        // g6's host moves to g5: g6 is deleted and its three guests are idle.
+        lobby.handle(ids[6], &msg(b"gjoi", "NAME=g5")).unwrap();
+        assert_eq!(stats_tuple(&lobby), (10, 30, 4, 3));
+
+        // The host of a started game disconnects: the game goes, its guests are idle.
+        lobby.leave(ids[0]);
+        assert_eq!(stats_tuple(&lobby), (13, 26, 3, 3));
+        assert_eq!(lobby.players_online(), 39);
+        assert_eq!(stats_tuple(&lobby), recount(&lobby));
+    }
+
+    #[test]
+    fn players_without_a_persona_are_not_counted() {
+        let (mut lobby, ids) = lobby_with(&["host"]);
+        let stranger = lobby.join("192.168.1.50".into());
+        assert_eq!(stats_tuple(&lobby), (1, 0, 0, 0));
+        assert_eq!(lobby.players_online(), 1);
+        lobby.claim_persona(stranger, "late");
+        assert_eq!(stats_tuple(&lobby), (2, 0, 0, 0));
+        assert_eq!(lobby.players_online(), 2);
+        lobby.handle(ids[0], &msg(b"gcre", "NAME=race\nMINSIZE=2\nMAXSIZE=4")).unwrap();
+        assert_eq!(stats_tuple(&lobby), (1, 1, 0, 1));
+    }
+
+    #[test]
+    fn stats_go_only_to_subscribers_and_only_when_they_change() {
+        let (mut lobby, ids) = lobby_with(&["a", "b", "c"]);
+        lobby.select(ids[0], &msg(b"sele", "STATS=1"));
+        lobby.select(ids[1], &msg(b"sele", "STATS=1"));
+
+        let out = lobby.stats_updates();
+        assert_eq!(sent_to(&out, ids[0]), ["+sst"]);
+        assert_eq!(sent_to(&out, ids[1]), ["+sst"]);
+        assert!(sent_to(&out, ids[2]).is_empty());
+        assert!(lobby.stats_updates().is_empty());
+
+        lobby.handle(ids[2], &msg(b"gcre", "NAME=race\nMINSIZE=2\nMAXSIZE=4")).unwrap();
+        let out = lobby.stats_updates();
+        assert_eq!(out.len(), 2);
+        let seen = parse(out.iter().find(|o| o.to == ids[0]).unwrap());
+        assert_eq!(seen.get("UIL").as_deref(), Some("2"));
+        assert_eq!(seen.get("UIG").as_deref(), Some("1"));
+        assert_eq!(seen.get("GCR").as_deref(), Some("1"));
+
+        // An unsubscribed client stops getting stats; a resubscribed one is
+        // brought up to date even though nothing changed since.
+        lobby.select(ids[1], &msg(b"sele", "STATS=0"));
+        lobby.handle(ids[0], &msg(b"gjoi", "NAME=race")).unwrap();
+        let out = lobby.stats_updates();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].to, ids[0]);
+        lobby.select(ids[1], &msg(b"sele", "STATS=1"));
+        let out = lobby.stats_updates();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].to, ids[1]);
+        assert_eq!(parse(&out[0]).get("UIG").as_deref(), Some("2"));
+        assert!(lobby.stats_updates().is_empty());
+    }
+
+    #[test]
+    fn browsers_get_one_record_each_that_differs_only_in_self() {
+        let (mut lobby, ids) = lobby_with(&["host", "guest", "b1", "b2", "b3"]);
+        let normal = "SYSFLAGS=0\nSYSMASK=786432";
+        lobby.handle(ids[2], &msg(b"gsea", normal)).unwrap();
+        lobby.handle(ids[3], &msg(b"gsea", normal)).unwrap();
+        // b3 only wants games whose CUSTFLAGS bit 0 is set; ours isn't.
+        lobby.handle(ids[4], &msg(b"gsea", &format!("CUSTFLAGS=1\nCUSTMASK=1\n{normal}"))).unwrap();
+
+        let gams = |out: &[Outgoing], id: ClientId| -> Vec<Message> {
+            out.iter().filter(|o| o.to == id).map(parse).filter(|m| &m.command == b"+gam").collect()
+        };
+        let out = lobby
+            .handle(
+                ids[0],
+                &msg(b"gcre", "NAME=race\nMINSIZE=2\nMAXSIZE=4\nCUSTFLAGS=134217968\nSYSFLAGS=0\nPARAMS=TRACK%3d4311"),
+            )
+            .unwrap();
+        assert_eq!(gams(&out, ids[2]).len(), 1);
+        assert_eq!(gams(&out, ids[3]).len(), 1);
+        assert!(gams(&out, ids[4]).is_empty());
+        assert!(gams(&out, ids[0]).is_empty());
+
+        let out = lobby.handle(ids[1], &msg(b"gjoi", "NAME=race")).unwrap();
+        let (one, two) = (gams(&out, ids[2]), gams(&out, ids[3]));
+        assert_eq!((one.len(), two.len()), (1, 1));
+        assert!(gams(&out, ids[4]).is_empty());
+        assert_eq!(one[0].get("SELF").as_deref(), Some("b1"));
+        assert_eq!(two[0].get("SELF").as_deref(), Some("b2"));
+        let shared = [
+            "IDENT", "NAME", "HOST", "PARAMS", "CUSTFLAGS", "SYSFLAGS", "COUNT", "MINSIZE", "MAXSIZE", "SEED", "OPID0",
+            "OPPO0", "ADDR0", "LADDR0", "OPPO1", "ADDR1", "LADDR1", "OPFLAG1",
+        ];
+        for key in shared {
+            assert_eq!(one[0].get(key), two[0].get(key), "{key}");
+        }
+        assert_eq!(one[0].get("COUNT").as_deref(), Some("2"));
+        assert_eq!(one[0].get("OPPO1").as_deref(), Some("guest"));
+        assert_eq!(one[0].get("PARAMS").as_deref(), Some("TRACK=4311"));
+    }
+
+    #[test]
+    fn joining_another_game_leaves_the_first() {
+        let (mut lobby, ids) = lobby_with(&["a", "b", "c"]);
+        let count = |lobby: &mut Lobby, name: &str| {
+            let out = lobby.handle(ids[2], &msg(b"gget", &format!("NAME={name}"))).unwrap();
+            (&out[0].data[4..8] == &[0; 4]).then(|| parse(&out[0]).get("COUNT").unwrap())
+        };
+        lobby.handle(ids[0], &msg(b"gcre", "NAME=g1\nMINSIZE=2\nMAXSIZE=4")).unwrap();
+        lobby.handle(ids[2], &msg(b"gcre", "NAME=g2\nMINSIZE=2\nMAXSIZE=4")).unwrap();
+        lobby.handle(ids[1], &msg(b"gjoi", "NAME=g1")).unwrap();
+        assert_eq!(count(&mut lobby, "g1").as_deref(), Some("2"));
+
+        // A guest moves: g1 survives with one fewer player.
+        lobby.handle(ids[1], &msg(b"gjoi", "NAME=g2")).unwrap();
+        assert_eq!(count(&mut lobby, "g1").as_deref(), Some("1"));
+        assert_eq!(count(&mut lobby, "g2").as_deref(), Some("2"));
+        assert_eq!(lobby.game_of(ids[1]), lobby.find_game_named("g2"));
+
+        // A host moves: its game is deleted.
+        lobby.handle(ids[0], &msg(b"gjoi", "NAME=g2")).unwrap();
+        assert_eq!(count(&mut lobby, "g1"), None);
+        assert_eq!(count(&mut lobby, "g2").as_deref(), Some("3"));
+        assert_eq!(lobby.game_of(ids[0]), lobby.find_game_named("g2"));
+    }
+
+    /// Small deterministic generator, so a failure reproduces from its seed.
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((self.0 >> 33) as usize) % n
+        }
+    }
+
+    /// Everything the lobby keeps redundantly must agree with a recount.
+    fn check_bookkeeping(lobby: &mut Lobby, seed: u64, step: usize) {
+        let at = format!("seed {seed} step {step}");
+        assert_eq!(stats_tuple(lobby), recount(lobby), "stats, {at}");
+        for id in lobby.players.keys() {
+            let holding: Vec<u32> = lobby.games.values().filter(|g| g.players.contains(id)).map(|g| g.ident).collect();
+            assert!(holding.len() <= 1, "client {id} in {holding:?}, {at}");
+            assert_eq!(lobby.game_of(*id), holding.first().copied(), "game_of({id}), {at}");
+        }
+        for game in lobby.games.values() {
+            assert!(game.players.contains(&game.host), "host left but game {} stays, {at}", game.ident);
+            assert!(game.players.len() as u32 <= game.maxsize.min(MAX_PLAYERS), "game {} overfull, {at}", game.ident);
+            let mut members = game.players.clone();
+            members.sort_unstable();
+            members.dedup();
+            assert_eq!(members.len(), game.players.len(), "duplicate member in game {}, {at}", game.ident);
+            assert!(game.players.iter().all(|p| lobby.players.contains_key(p)), "ghost in game {}, {at}", game.ident);
+            assert_eq!(game.flags.len(), game.players.len(), "flags of game {}, {at}", game.ident);
+        }
+        for (id, player) in &lobby.players {
+            let Some(search) = &player.search else { continue };
+            let expected: BTreeSet<u32> =
+                lobby.games.values().filter(|g| search.matches(g, lobby.filter)).map(|g| g.ident).collect();
+            assert_eq!(player.visible, expected, "browser list of {id}, {at}");
+        }
+        lobby.stats_updates();
+        let current = lobby.stats();
+        for (id, player) in &lobby.players {
+            if player.wants_stats {
+                assert_eq!(player.last_stats, Some(current), "stale stats for {id}, {at}");
+            }
+        }
+    }
+
+    #[test]
+    fn bookkeeping_matches_a_recount_through_random_play() {
+        const SLOTS: usize = 24;
+        let searches = [
+            "SYSFLAGS=0\nSYSMASK=786432",
+            "CUSTFLAGS=134217968\nCUSTMASK=134218227\nSYSFLAGS=0\nSYSMASK=786432",
+            "CUSTFLAGS=536871152\nCUSTMASK=134218227\nSYSFLAGS=0\nSYSMASK=786432",
+            "",
+        ];
+        let flags = [134217968u32, 536871152];
+        for seed in 1..=4u64 {
+            let mut rng = Rng(seed);
+            let mut lobby = Lobby::new(Filter::Ea);
+            let login = |lobby: &mut Lobby, slot: usize| {
+                let id = lobby.join(format!("192.168.1.{}", 100 + slot));
+                lobby.claim_persona(id, &format!("p{slot}"));
+                lobby.select(id, &msg(b"sele", "STATS=1\nMYGAME=1\nMESGS=1"));
+                id
+            };
+            let mut ids: Vec<ClientId> = (0..SLOTS).map(|slot| login(&mut lobby, slot)).collect();
+            let mut created = 0;
+            for step in 0..600 {
+                let slot = rng.below(SLOTS);
+                let id = ids[slot];
+                let names: Vec<String> = lobby.games.values().map(|g| g.name.clone()).collect();
+                match rng.below(9) {
+                    0 | 1 if lobby.games.len() < 30 => {
+                        created += 1;
+                        let body = format!(
+                            "NAME=g{created}\nMINSIZE=2\nMAXSIZE={}\nCUSTFLAGS={}\nSYSFLAGS=0",
+                            2 + rng.below(4),
+                            flags[rng.below(2)]
+                        );
+                        lobby.handle(id, &msg(b"gcre", &body)).unwrap();
+                    }
+                    2 | 3 | 4 => {
+                        let name = if names.is_empty() { "none".to_string() } else { names[rng.below(names.len())].clone() };
+                        lobby.handle(id, &msg(b"gjoi", &format!("NAME={name}"))).unwrap();
+                    }
+                    5 => {
+                        lobby.handle(id, &msg(b"glea", "")).unwrap();
+                    }
+                    6 => {
+                        lobby.handle(id, &msg(b"gdel", "")).unwrap();
+                    }
+                    7 => {
+                        lobby.handle(id, &msg(b"gsta", "")).unwrap();
+                    }
+                    8 => match rng.below(3) {
+                        0 => {
+                            lobby.leave(id);
+                            ids[slot] = login(&mut lobby, slot);
+                        }
+                        1 => {
+                            lobby.handle(id, &msg(b"gsea", "CANCEL=1")).unwrap();
+                        }
+                        _ => {
+                            lobby.handle(id, &msg(b"gsea", searches[rng.below(searches.len())])).unwrap();
+                        }
+                    },
+                    _ => {}
+                }
+                check_bookkeeping(&mut lobby, seed, step);
+            }
+        }
     }
 }

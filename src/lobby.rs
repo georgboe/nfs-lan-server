@@ -42,6 +42,10 @@ const SESSION_KEY: &str = "$51ba8aee64ddfacae5baefa6bf61e009";
 /// the server pings it. Like server.dll (FUN_10015530) the ping carries only
 /// REF, the current UTC time, which SPEED2.EXE parses as a date.
 const PING_INTERVAL: Duration = Duration::from_secs(10);
+/// Stats (`+sst`) and the beacon's racer count are refreshed this often
+/// rather than after every request, which would send every client a message
+/// per login, create and join.
+const STATS_INTERVAL: Duration = Duration::from_secs(1);
 /// A client that doesn't take its data within this time is disconnected.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -366,12 +370,17 @@ impl Shared {
     }
 }
 
-/// Answers one lobby request from `id`, then sends changed stats to everyone.
-fn handle_lobby(shared: &mut Shared, id: ClientId, peer: SocketAddr, msg: &Message, log: &Log, who: &str) {
-    answer_lobby(shared, id, peer, msg, log, who);
+/// Sends changed stats to the clients that want them and publishes the
+/// racer count for the beacon.
+fn flush_stats(shared: &mut Shared) {
     let out = shared.lobby.stats_updates();
     shared.deliver(out);
     PLAYERS_ONLINE.store(shared.lobby.players_online(), Ordering::Relaxed);
+}
+
+/// Answers one lobby request from `id`.
+fn handle_lobby(shared: &mut Shared, id: ClientId, peer: SocketAddr, msg: &Message, log: &Log, who: &str) {
+    answer_lobby(shared, id, peer, msg, log, who);
 }
 
 fn answer_lobby(shared: &mut Shared, id: ClientId, peer: SocketAddr, msg: &Message, log: &Log, who: &str) {
@@ -459,10 +468,8 @@ fn serve_lobby(mut stream: TcpStream, who: String, log: Log, shared: Arc<Mutex<S
     }
     let mut shared = shared.lock().unwrap();
     shared.writers.remove(&id);
-    let mut out = shared.lobby.leave(id);
-    out.extend(shared.lobby.stats_updates());
+    let out = shared.lobby.leave(id);
     shared.deliver(out);
-    PLAYERS_ONLINE.store(shared.lobby.players_online(), Ordering::Relaxed);
 }
 
 fn listen<F>(port: u16, label: &'static str, log: Log, handler: F) -> std::io::Result<()>
@@ -512,6 +519,11 @@ pub(crate) fn spawn(log: Log, filter: Filter, redirect_port: u16, lobby_port: u1
         let shared = pinged.lock().unwrap();
         let out = shared.writers.keys().map(|&to| Outgoing { to, data: ping.clone() }).collect();
         shared.deliver(out);
+    });
+    let counted = Arc::clone(&shared);
+    thread::spawn(move || loop {
+        thread::sleep(STATS_INTERVAL);
+        flush_stats(&mut counted.lock().unwrap());
     });
     thread::spawn(move || {
         let result = listen(lobby_port, "lobby", log, move |stream, who, log| {
@@ -576,6 +588,28 @@ mod tests {
         // An incomplete but valid frame just waits for more data.
         let mut partial = b"news\0\0\0\0\0\0\0\x20NAME".to_vec();
         assert!(matches!(next_frame(&mut partial), Ok(None)));
+    }
+
+    #[test]
+    fn flush_sends_changed_stats_once_and_publishes_the_racer_count() {
+        let mut shared = Shared { lobby: Lobby::new(Filter::Off), writers: HashMap::new() };
+        let id = shared.lobby.join("192.168.1.100".into());
+        let (tx, rx) = mpsc::channel();
+        shared.writers.insert(id, tx);
+        shared.lobby.claim_persona(id, "racer");
+        shared.lobby.select(id, &Message { command: *b"sele", body: b"STATS=1\0".to_vec() });
+        assert!(rx.try_recv().is_err(), "nothing is sent until the flush");
+
+        flush_stats(&mut shared);
+        let mut stats = rx.try_iter().collect::<Vec<_>>();
+        assert_eq!(stats.len(), 1);
+        let msg = decode(&mut stats.remove(0)).unwrap();
+        assert_eq!(&msg.command, b"+sst");
+        assert_eq!(msg.get("UIL").as_deref(), Some("1"));
+        assert_eq!(PLAYERS_ONLINE.load(Ordering::Relaxed), 1);
+
+        flush_stats(&mut shared);
+        assert!(rx.try_recv().is_err(), "unchanged stats aren't resent");
     }
 
     #[test]
