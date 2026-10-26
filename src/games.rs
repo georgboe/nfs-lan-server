@@ -64,6 +64,7 @@
 //!   uploads `auxi` after login, so `+who` is sent again after each upload.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::lobby::{encode_for, Message};
@@ -130,10 +131,14 @@ impl Variant {
     }
 }
 
+/// An encoded message. Shared, so a message that goes to many clients is
+/// encoded once and only its reference is copied per recipient.
+pub(crate) type Packet = Arc<[u8]>;
+
 /// A message for one client.
 pub(crate) struct Outgoing {
     pub to: ClientId,
-    pub data: Vec<u8>,
+    pub data: Packet,
 }
 
 #[derive(Default)]
@@ -145,6 +150,8 @@ pub(crate) struct Player {
     pub local_addr: String,
     /// Most Wanted's machine address: the MAC (`$hex`) from `auth`/`pers`.
     pub mac: String,
+    /// The game this client is in, kept in step with `Game::players`.
+    game: Option<u32>,
     /// The client's current `gsea` filter, if it is browsing games.
     pub search: Option<Search>,
     /// Games currently in this client's browser list.
@@ -374,13 +381,18 @@ fn seed() -> u32 {
 /// A message for `to` encoded for `variant`, for loops that hold the lobby
 /// mutably (`Lobby::reply` otherwise).
 fn reply_as(variant: Variant, to: ClientId, command: &[u8; 4], status: &[u8; 4], fields: &[(&str, String)]) -> Outgoing {
-    Outgoing { to, data: encode_for(variant, command, status, fields) }
+    Outgoing { to, data: encode_for(variant, command, status, fields).into() }
 }
 
 impl Lobby {
     /// A message for `to`, encoded for this lobby's game.
     fn reply(&self, to: ClientId, command: &[u8; 4], status: &[u8; 4], fields: &[(&str, String)]) -> Outgoing {
         reply_as(self.variant, to, command, status, fields)
+    }
+
+    /// A message encoded once, to send the same bytes to several clients.
+    fn packet(&self, command: &[u8; 4], status: &[u8; 4], fields: &[(&str, String)]) -> Packet {
+        encode_for(self.variant, command, status, fields).into()
     }
 
     fn error(&self, to: ClientId, command: &[u8; 4], status: [u8; 4]) -> Vec<Outgoing> {
@@ -415,7 +427,8 @@ impl Lobby {
     /// Takes a client that hasn't logged in out of this lobby, to move it to
     /// its game's lobby.
     pub fn hand_over(&mut self, id: ClientId) -> Option<Player> {
-        self.players.remove(&id)
+        // Games stay with this lobby, so the player arrives in none.
+        self.players.remove(&id).map(|player| Player { game: None, ..player })
     }
 
     pub fn take_over(&mut self, id: ClientId, player: Player) {
@@ -595,26 +608,26 @@ impl Lobby {
     pub fn stats_updates(&mut self) -> Vec<Outgoing> {
         let stats = self.stats();
         let variant = self.variant;
+        // Encoded on first use, then shared by every recipient.
+        let mut packet: Option<Packet> = None;
         let mut out = Vec::new();
         for (id, player) in self.players.iter_mut() {
             if !player.wants_stats || player.last_stats == Some(stats) {
                 continue;
             }
             player.last_stats = Some(stats);
-            out.push(reply_as(
-                variant,
-                *id,
-                b"+sst",
-                &OK,
-                &[
+            let data = packet.get_or_insert_with(|| {
+                let fields = [
                     ("UIL", stats.users_in_lobby.to_string()),
                     ("UIR", "0".to_string()),
                     ("UIG", stats.users_in_games.to_string()),
                     ("GIP", stats.games_in_progress.to_string()),
                     ("GCR", stats.games_unstarted.to_string()),
                     ("GCM", "0".to_string()),
-                ],
-            ));
+                ];
+                encode_for(variant, b"+sst", &OK, &fields).into()
+            });
+            out.push(Outgoing { to: *id, data: data.clone() });
         }
         out
     }
@@ -640,7 +653,10 @@ impl Lobby {
             }
         }
         let mut out: Vec<Outgoing> = shown.iter().map(|to| self.game_message(b"+gam", game, *to)).collect();
-        out.extend(hidden.iter().map(|to| self.reply(*to, b"+gam", &OK, &[("IDENT", ident.to_string())])));
+        if !hidden.is_empty() {
+            let removal = self.packet(b"+gam", &OK, &[("IDENT", ident.to_string())]);
+            out.extend(hidden.iter().map(|&to| Outgoing { to, data: removal.clone() }));
+        }
         for id in shown {
             self.players.get_mut(&id).expect("player exists").visible.insert(ident);
         }
@@ -652,11 +668,11 @@ impl Lobby {
 
     /// A `+gam` without NAME for every browser listing game `ident`.
     fn announce_removed(&mut self, ident: u32) -> Vec<Outgoing> {
-        let variant = self.variant;
+        let removal = self.packet(b"+gam", &OK, &[("IDENT", ident.to_string())]);
         let mut out = Vec::new();
         for (id, player) in self.players.iter_mut() {
             if player.visible.remove(&ident) {
-                out.push(reply_as(variant, *id, b"+gam", &OK, &[("IDENT", ident.to_string())]));
+                out.push(Outgoing { to: *id, data: removal.clone() });
             }
         }
         out
@@ -705,16 +721,21 @@ impl Lobby {
         };
         game.players.retain(|p| *p != id);
         game.flags.remove(&id);
+        self.set_game_of(id, None);
         // The leaver's record changed (no game now): `+who` before any `+mgm`.
         let mut out: Vec<Outgoing> = self.who(id).into_iter().collect();
         let game = &self.games[&ident];
         if game.host == id || game.players.is_empty() {
             let game = self.games.remove(&ident).expect("game exists");
+            for member in &game.players {
+                self.set_game_of(*member, None);
+            }
             out.extend(self.announce_removed(ident));
             // Everyone who was in it, the leaver included, learns it's gone.
             let former = game.players.iter().copied().chain([id]);
+            let gone = self.packet(b"+mgm", &OK, &[("IDENT", ident.to_string())]);
             for member in former.filter(|m| self.wants_game_updates(*m)) {
-                out.push(self.reply(member, b"+mgm", &OK, &[("IDENT", ident.to_string())]));
+                out.push(Outgoing { to: member, data: gone.clone() });
             }
         } else {
             out.extend(self.notify_members(game, None));
@@ -798,6 +819,7 @@ impl Lobby {
         let ident = game.ident;
         out.push(self.game_message(b"gcre", &game, id));
         self.games.insert(ident, game);
+        self.set_game_of(id, Some(ident));
         out.extend(self.who(id));
         out.extend(self.member_updates(id));
         out.extend(self.notify_members(&self.games[&ident], None));
@@ -862,6 +884,7 @@ impl Lobby {
         let game = self.games.get_mut(&ident).expect("game exists");
         game.players.push(id);
         game.flags.insert(id, flags);
+        self.set_game_of(id, Some(ident));
         let game = &self.games[&ident];
         out.push(self.game_message(b"gjoi", game, id));
         out.extend(self.who(id));
@@ -914,6 +937,9 @@ impl Lobby {
         for player in &kicked {
             game.players.retain(|p| p != player);
             game.flags.remove(player);
+        }
+        for player in &kicked {
+            self.set_game_of(*player, None);
         }
 
         let game = &self.games[&ident];
@@ -1049,12 +1075,13 @@ impl Lobby {
                                 .collect(),
                         };
                         let mut out = vec![self.reply(id, b"mesg", &OK, &[])];
-                        out.extend(
-                            recipients
-                                .into_iter()
-                                .filter(|to| self.players[to].wants_messages)
-                                .map(|to| chat(to, flags)),
-                        );
+                        let recipients: Vec<ClientId> =
+                            recipients.into_iter().filter(|to| self.players[to].wants_messages).collect();
+                        if let Some(&first) = recipients.first() {
+                            // Every recipient gets the same line: encode it once.
+                            let line = chat(first, flags).data;
+                            out.extend(recipients.into_iter().map(|to| Outgoing { to, data: line.clone() }));
+                        }
                         out
                     }
                 }
@@ -1080,7 +1107,15 @@ impl Lobby {
     }
 
     fn game_of(&self, id: ClientId) -> Option<u32> {
-        self.games.values().find(|g| g.players.contains(&id)).map(|g| g.ident)
+        self.players.get(&id).and_then(|p| p.game)
+    }
+
+    /// Records which game `id` is in; every change to a game's players goes
+    /// through here.
+    fn set_game_of(&mut self, id: ClientId, game: Option<u32>) {
+        if let Some(player) = self.players.get_mut(&id) {
+            player.game = game;
+        }
     }
 
     fn leave_games(&mut self, id: ClientId) -> Vec<Outgoing> {
@@ -1101,7 +1136,7 @@ mod tests {
     }
 
     fn parse(out: &Outgoing) -> Message {
-        decode(&mut out.data.clone()).unwrap()
+        decode(&mut out.data.to_vec()).unwrap()
     }
 
     /// A lobby using EA's filter rules, which most tests check.

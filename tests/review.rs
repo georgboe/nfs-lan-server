@@ -38,7 +38,7 @@ mod review {
     }
 
     fn field(out: &Outgoing, key: &str) -> Option<String> {
-        decode(&mut out.data.clone()).unwrap().get(key)
+        decode(&mut out.data.to_vec()).unwrap().get(key)
     }
 
     fn create(lobby: &mut Lobby, host: u32) {

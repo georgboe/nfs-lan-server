@@ -274,13 +274,14 @@ mod tests {
     }
 }
 
-/// The traffic log; `None` when debug_mode is off, which turns `record` off.
-pub(crate) type Log = Arc<Mutex<Option<File>>>;
+/// The traffic log; `None` when debug_mode is off, which turns `record` off
+/// without taking a lock.
+pub(crate) type Log = Option<Arc<Mutex<File>>>;
 
 /// A log that records nothing, for tests.
 #[cfg(test)]
 pub(crate) fn test_log() -> Log {
-    Arc::new(Mutex::new(None))
+    None
 }
 
 fn now_millis() -> u128 {
@@ -291,28 +292,26 @@ fn now_millis() -> u128 {
 }
 
 pub(crate) fn record(log: &Log, peer: &str, kind: &str, data: &[u8]) {
-    let Ok(mut file) = log.lock() else { return };
-    let Some(file) = file.as_mut() else { return };
-    let mut out = String::new();
-    out.push_str(&format!("[{}] {} {} ({} bytes)\n", now_millis(), kind, peer, data.len()));
+    let Some(log) = log else { return };
+    // Formatted before taking the lock, so other connections only wait for the write.
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = format!("[{}] {} {} ({} bytes)\n", now_millis(), kind, peer, data.len()).into_bytes();
+    out.reserve(data.len().div_ceil(16) * 76);
     for (i, chunk) in data.chunks(16).enumerate() {
-        out.push_str(&format!("  {:04x}  ", i * 16));
-        for b in chunk {
-            out.push_str(&format!("{:02x} ", b));
+        let _ = write!(out, "  {:04x}  ", i * 16);
+        for &b in chunk {
+            out.extend_from_slice(&[HEX[(b >> 4) as usize], HEX[(b & 0xf) as usize], b' ']);
         }
         for _ in chunk.len()..16 {
-            out.push_str("   ");
+            out.extend_from_slice(b"   ");
         }
-        out.push(' ');
-        for &b in chunk {
-            let c = if (0x20..0x7f).contains(&b) { b as char } else { '.' };
-            out.push(c);
-        }
-        out.push('\n');
+        out.push(b' ');
+        out.extend(chunk.iter().map(|&b| if (0x20..0x7f).contains(&b) { b } else { b'.' }));
+        out.push(b'\n');
     }
-    let _ = file.write_all(out.as_bytes());
-    let _ = file.flush();
-    print!("{}", out);
+    let Ok(mut file) = log.lock() else { return };
+    let _ = file.write_all(&out);
+    let _ = std::io::stdout().lock().write_all(&out);
 }
 
 fn handle_tcp(mut stream: std::net::TcpStream, peer: SocketAddr, port: u16, log: Log) {
@@ -341,8 +340,11 @@ fn listen_tcp(port: u16, log: Log) -> std::io::Result<()> {
         match conn {
             Ok(stream) => {
                 let peer = stream.peer_addr().unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
-                let log = Arc::clone(&log);
-                thread::spawn(move || handle_tcp(stream, peer, port, log));
+                let log = log.clone();
+                // Out of threads: drop this connection and keep accepting.
+                if let Err(e) = thread::Builder::new().spawn(move || handle_tcp(stream, peer, port, log)) {
+                    eprintln!("tcp :{} connection from {} dropped: {}", port, peer, e);
+                }
             }
             Err(e) => eprintln!("accept on :{} failed: {}", port, e),
         }
@@ -368,19 +370,19 @@ fn main() -> std::io::Result<()> {
     println!("config {}: games {:?}, filter {:?}, debug_mode {}", path, config.games, config.filter, config.debug_mode);
     let identity = BeaconIdentity::new(&config.name, REDIRECT_PORT, beacon_tags(&config.games));
 
-    let log: Log = Arc::new(Mutex::new(None));
+    let mut log: Log = None;
     if config.debug_mode {
         fs::create_dir_all(LOG_DIR)?;
         let path = format!("{}/session-{}.log", LOG_DIR, now_millis());
-        *log.lock().unwrap() = Some(File::create(&path)?);
+        log = Some(Arc::new(Mutex::new(File::create(&path)?)));
         println!("logging to {}", path);
     }
 
-    lobby::spawn(Arc::clone(&log), config.filter, &config.games, REDIRECT_PORT, LOBBY_PORT);
+    lobby::spawn(log.clone(), config.filter, &config.games, REDIRECT_PORT, LOBBY_PORT);
     let mut handles = Vec::new();
     if config.debug_mode {
         for &port in DEBUG_TCP_PORTS {
-            let log = Arc::clone(&log);
+            let log = log.clone();
             handles.push(thread::spawn(move || {
                 if let Err(e) = listen_tcp(port, log) {
                     eprintln!("tcp :{} failed: {}", port, e);
@@ -389,7 +391,7 @@ fn main() -> std::io::Result<()> {
         }
     }
     {
-        let log = Arc::clone(&log);
+        let log = log.clone();
         handles.push(thread::spawn(move || {
             if let Err(e) = run_beacon(default_beacon_targets(), identity, Some(log)) {
                 eprintln!("beacon failed: {}", e);

@@ -30,7 +30,7 @@ mod review {
     }
 
     fn field(out: &Outgoing, key: &str) -> Option<String> {
-        decode(&mut out.data.clone()).unwrap().get(key)
+        decode(&mut out.data.to_vec()).unwrap().get(key)
     }
 
     fn setup() -> (Lobby, Vec<u32>) {

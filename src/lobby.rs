@@ -36,7 +36,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::games::{ClientId, Filter, Lobby, Outgoing, Variant};
+use crate::games::{ClientId, Filter, Lobby, Outgoing, Packet, Variant};
 use crate::{record, Log};
 
 const HEADER_LEN: usize = 12;
@@ -79,35 +79,45 @@ fn bytes_to_string(bytes: &[u8]) -> String {
     out
 }
 
-/// A string as value bytes, undoing `bytes_to_string`.
-fn string_to_bytes(value: &str) -> Vec<u8> {
-    let mut out = Vec::new();
-    for c in value.chars() {
+/// Writes `value` encoded for `variant` to `out`. Characters from
+/// `bytes_to_string` go out as their original byte; those bytes are all
+/// 0x80 and up, as are every UTF-8 multi-byte sequence's, so only ASCII
+/// ever needs escaping.
+fn encode_value_into(out: &mut Vec<u8>, variant: Variant, value: &str) {
+    // Most Wanted quotes a value containing a space or comma.
+    let quoted = variant == Variant::MostWanted && value.bytes().any(|b| b == b' ' || b == b',');
+    if quoted {
+        out.push(b'"');
+    }
+    for (i, c) in value.char_indices() {
         match c as u32 {
+            n @ 0..0x80 => {
+                let b = n as u8;
+                let escaped = b < 0x20 || b == 0x7f || b == b'%' || match variant {
+                    Variant::Underground2 => i == 0 && b == b'"',
+                    Variant::MostWanted => b == b'"' || b == b'=',
+                };
+                if escaped {
+                    const HEX: &[u8; 16] = b"0123456789abcdef";
+                    out.extend_from_slice(&[b'%', HEX[(b >> 4) as usize], HEX[(b & 0xf) as usize]]);
+                } else {
+                    out.push(b);
+                }
+            }
             n @ 0xF780..=0xF7FF => out.push((n - RAW_BYTE_BASE) as u8),
             _ => out.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes()),
         }
     }
-    out
-}
-
-fn encode_value(variant: Variant, value: &str) -> Vec<u8> {
-    match variant {
-        Variant::Underground2 => encode_value_u2(value),
-        Variant::MostWanted => encode_value_mw(value),
+    if quoted {
+        out.push(b'"');
     }
 }
 
 /// Underground 2: raw except what would break parsing.
+#[cfg(test)]
 fn encode_value_u2(value: &str) -> Vec<u8> {
     let mut out = Vec::new();
-    for (i, b) in string_to_bytes(value).into_iter().enumerate() {
-        if b < 0x20 || b == 0x7f || b == b'%' || (i == 0 && b == b'"') {
-            out.extend_from_slice(format!("%{:02x}", b).as_bytes());
-        } else {
-            out.push(b);
-        }
-    }
+    encode_value_into(&mut out, Variant::Underground2, value);
     out
 }
 
@@ -115,23 +125,10 @@ fn encode_value_u2(value: &str) -> Vec<u8> {
 /// 0x1004d338): control bytes, `"`, `%`, `=` and DEL become `%xx`, and a
 /// value containing a space or comma is quoted. A raw `=` inside a value
 /// garbles nested PARAMS such as `V=..%0aE=..` in the game room.
+#[cfg(test)]
 fn encode_value_mw(value: &str) -> Vec<u8> {
-    let bytes = string_to_bytes(value);
-    let quoted = bytes.iter().any(|&b| b == b' ' || b == b',');
     let mut out = Vec::new();
-    if quoted {
-        out.push(b'"');
-    }
-    for b in bytes {
-        if b < 0x20 || b == 0x7f || b == b'%' || b == b'"' || b == b'=' {
-            out.extend_from_slice(format!("%{:02x}", b).as_bytes());
-        } else {
-            out.push(b);
-        }
-    }
-    if quoted {
-        out.push(b'"');
-    }
+    encode_value_into(&mut out, Variant::MostWanted, value);
     out
 }
 
@@ -204,27 +201,30 @@ pub(crate) fn encode(command: &[u8; 4], status: &[u8; 4], fields: &[(&str, Strin
 
 /// A message with `variant`'s value encoding (see `encode_value_mw`).
 pub(crate) fn encode_for(variant: Variant, command: &[u8; 4], status: &[u8; 4], fields: &[(&str, String)]) -> Vec<u8> {
-    let mut body = Vec::new();
-    for (key, value) in fields {
-        body.extend_from_slice(key.as_bytes());
-        body.push(b'=');
-        body.extend_from_slice(&encode_value(variant, value));
-        body.push(b'\n');
-    }
-    let len = HEADER_LEN + body.len() + 1;
-    let mut out = Vec::with_capacity(len);
+    // Roughly the encoded size, so the buffer rarely grows.
+    let estimate = HEADER_LEN + 1 + fields.iter().map(|(key, value)| key.len() + value.len() + 4).sum::<usize>();
+    let mut out = Vec::with_capacity(estimate);
     out.extend_from_slice(command);
     out.extend_from_slice(status);
-    out.extend_from_slice(&(len as u32).to_be_bytes());
-    out.extend_from_slice(&body);
+    // The length is filled in once the body is written.
+    out.extend_from_slice(&[0; 4]);
+    for (key, value) in fields {
+        out.extend_from_slice(key.as_bytes());
+        out.push(b'=');
+        encode_value_into(&mut out, variant, value);
+        out.push(b'\n');
+    }
     out.push(0);
+    let len = out.len() as u32;
+    out[8..HEADER_LEN].copy_from_slice(&len.to_be_bytes());
     out
 }
 
-/// Takes one complete message off the front of `buf`, if there is one. A
-/// declared length outside HEADER_LEN..=MAX_MESSAGE is an error: the stream
-/// can't be resynchronised, so the connection must be closed.
-pub(crate) fn next_frame(buf: &mut Vec<u8>) -> Result<Option<Message>, String> {
+/// Reads one complete message from the front of `buf`, if there is one, and
+/// returns it with the number of bytes it took. A declared length outside
+/// HEADER_LEN..=MAX_MESSAGE is an error: the stream can't be resynchronised,
+/// so the connection must be closed.
+pub(crate) fn next_frame(buf: &[u8]) -> Result<Option<(Message, usize)>, String> {
     if buf.len() < HEADER_LEN {
         return Ok(None);
     }
@@ -235,43 +235,43 @@ pub(crate) fn next_frame(buf: &mut Vec<u8>) -> Result<Option<Message>, String> {
     if buf.len() < len {
         return Ok(None);
     }
-    let raw: Vec<u8> = buf.drain(..len).collect();
-    Ok(Some(Message {
-        command: [raw[0], raw[1], raw[2], raw[3]],
-        body: raw[HEADER_LEN..].to_vec(),
-    }))
+    let message = Message { command: [buf[0], buf[1], buf[2], buf[3]], body: buf[HEADER_LEN..len].to_vec() };
+    Ok(Some((message, len)))
 }
 
-/// `next_frame` for callers that only hold valid frames.
+/// Takes one message off the front of `buf`, for callers that only hold
+/// valid frames.
 #[cfg(test)]
 pub(crate) fn decode(buf: &mut Vec<u8>) -> Option<Message> {
-    next_frame(buf).ok().flatten()
+    let (message, len) = next_frame(buf).ok().flatten()?;
+    buf.drain(..len);
+    Some(message)
 }
 
-fn send(stream: &mut TcpStream, log: &Log, who: &str, data: Vec<u8>) -> std::io::Result<()> {
+fn send(stream: &mut TcpStream, log: &Log, who: &str, data: &[u8]) -> std::io::Result<()> {
     // An empty answer means "handled, nothing to send".
     if data.is_empty() {
         return Ok(());
     }
-    record(log, who, "SEND", &data);
-    stream.write_all(&data).inspect_err(|e| record(log, who, "ERROR", e.to_string().as_bytes()))
+    record(log, who, "SEND", data);
+    stream.write_all(data).inspect_err(|e| record(log, who, "ERROR", e.to_string().as_bytes()))
 }
 
 /// Starts the thread that writes everything queued for one client, so that
 /// a slow client never blocks the lobby. It disconnects a client that stops
-/// reading.
-fn spawn_writer(mut stream: TcpStream, who: String, log: Log) -> Sender<Vec<u8>> {
-    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+/// reading. Fails if the system won't start another thread.
+fn spawn_writer(mut stream: TcpStream, who: String, log: Log) -> std::io::Result<Sender<Packet>> {
+    let (tx, rx) = mpsc::channel::<Packet>();
     let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
-    thread::spawn(move || {
+    thread::Builder::new().name("lobby-writer".into()).spawn(move || {
         for data in rx {
-            if send(&mut stream, &log, &who, data).is_err() {
+            if send(&mut stream, &log, &who, &data).is_err() {
                 let _ = stream.shutdown(Shutdown::Both);
                 break;
             }
         }
-    });
-    tx
+    })?;
+    Ok(tx)
 }
 
 /// Reads messages off `stream` and hands each to `reply` until the peer closes.
@@ -296,9 +296,13 @@ where
         };
         record(&log, &who, "RECV", &buf[..n]);
         pending.extend_from_slice(&buf[..n]);
+        let mut taken = 0;
         loop {
-            let msg = match next_frame(&mut pending) {
-                Ok(Some(msg)) => msg,
+            let msg = match next_frame(&pending[taken..]) {
+                Ok(Some((msg, len))) => {
+                    taken += len;
+                    msg
+                }
                 Ok(None) => break,
                 Err(e) => {
                     record(&log, &who, "ERROR", e.as_bytes());
@@ -310,11 +314,12 @@ where
                 record(&log, &who, &format!("UNHANDLED {}", msg.name()), &[]);
             }
             for answer in answers {
-                if send(&mut stream, &log, &who, answer).is_err() {
+                if send(&mut stream, &log, &who, &answer).is_err() {
                     return;
                 }
             }
         }
+        pending.drain(..taken);
     }
 }
 
@@ -430,7 +435,7 @@ struct Shared {
     /// Index into `lobbies` of each connected client's lobby. A client starts
     /// in the first and moves to its game's lobby at `auth`.
     homes: HashMap<ClientId, usize>,
-    writers: HashMap<ClientId, Sender<Vec<u8>>>,
+    writers: HashMap<ClientId, Sender<Packet>>,
     /// Client ids are unique across lobbies, since writers are keyed by them.
     next_client: ClientId,
 }
@@ -534,7 +539,7 @@ fn answer_lobby(shared: &mut Shared, id: ClientId, peer: SocketAddr, msg: &Messa
     let self_addr = SelfAddr { local: &local, mac: &mac };
     let answers = lobby_reply(msg, peer, &persona, shared.lobby(id).variant(), &self_addr);
     if !answers.is_empty() {
-        let mut out: Vec<Outgoing> = answers.into_iter().map(|data| Outgoing { to: id, data }).collect();
+        let mut out: Vec<Outgoing> = answers.into_iter().map(|data| Outgoing { to: id, data: data.into() }).collect();
         // Login is complete once the persona is chosen: tell the client who it is.
         if &msg.command == b"pers" {
             out.extend(shared.lobby(id).who(id));
@@ -548,7 +553,7 @@ fn answer_lobby(shared: &mut Shared, id: ClientId, peer: SocketAddr, msg: &Messa
         return;
     }
     record(log, who, &format!("GENERIC {}", msg.name()), &[]);
-    let data = encode_for(shared.lobby(id).variant(), &msg.command, &[0; 4], &[]);
+    let data = encode_for(shared.lobby(id).variant(), &msg.command, &[0; 4], &[]).into();
     shared.deliver(vec![Outgoing { to: id, data }]);
 }
 
@@ -558,10 +563,19 @@ fn serve_lobby(mut stream: TcpStream, who: String, log: Log, shared: Arc<Mutex<S
         _ => return,
     };
     record(&log, &who, "CONNECT", &[]);
+    // Started before taking the lock, so a failure leaves the lobby untouched.
+    let writer = match spawn_writer(writer, who.clone(), log.clone()) {
+        Ok(writer) => writer,
+        Err(e) => {
+            eprintln!("{} dropped: no writer thread ({})", who, e);
+            let _ = stream.shutdown(Shutdown::Both);
+            return;
+        }
+    };
     let id = {
         let mut shared = shared.lock().unwrap();
         let id = shared.connect(peer.ip().to_string());
-        shared.writers.insert(id, spawn_writer(writer, who.clone(), log.clone()));
+        shared.writers.insert(id, writer);
         id
     };
     let mut pending = Vec::new();
@@ -582,9 +596,13 @@ fn serve_lobby(mut stream: TcpStream, who: String, log: Log, shared: Arc<Mutex<S
         pending.extend_from_slice(&buf[..n]);
         let mut shared = shared.lock().unwrap();
         let mut invalid = false;
+        let mut taken = 0;
         loop {
-            match next_frame(&mut pending) {
-                Ok(Some(msg)) => handle_lobby(&mut shared, id, peer, &msg, &log, &who),
+            match next_frame(&pending[taken..]) {
+                Ok(Some((msg, len))) => {
+                    taken += len;
+                    handle_lobby(&mut shared, id, peer, &msg, &log, &who);
+                }
                 Ok(None) => break,
                 Err(e) => {
                     record(&log, &who, "ERROR", e.as_bytes());
@@ -593,6 +611,8 @@ fn serve_lobby(mut stream: TcpStream, who: String, log: Log, shared: Arc<Mutex<S
                 }
             }
         }
+        drop(shared);
+        pending.drain(..taken);
         if invalid {
             let _ = stream.shutdown(Shutdown::Both);
             break;
@@ -616,7 +636,12 @@ where
                 let who = format!("{}->:{}/{}", peer, port, label);
                 let log = log.clone();
                 let handler = handler.clone();
-                thread::spawn(move || handler(stream, who, log));
+                // Out of threads: drop this connection (the closure owns the
+                // stream) and keep accepting, instead of panicking the listener.
+                let spawned = thread::Builder::new().name(format!("{}-conn", label)).spawn(move || handler(stream, who, log));
+                if let Err(e) = spawned {
+                    eprintln!("{} connection from {} dropped: {}", label, peer, e);
+                }
             }
             Err(e) => eprintln!("{} accept failed: {}", label, e),
         }
@@ -647,8 +672,8 @@ pub(crate) fn spawn(log: Log, filter: Filter, games: &[Variant], redirect_port: 
         thread::sleep(PING_INTERVAL);
         let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         // REF has a space, which Most Wanted's encoding quotes.
-        let pings: Vec<Vec<u8>> =
-            Variant::ALL.iter().map(|&game| encode_for(game, b"~png", &[0; 4], &[("REF", utc_date(now))])).collect();
+        let pings: Vec<Packet> =
+            Variant::ALL.iter().map(|&game| encode_for(game, b"~png", &[0; 4], &[("REF", utc_date(now))]).into()).collect();
         let shared = pinged.lock().unwrap();
         let out = shared
             .writers
@@ -731,6 +756,73 @@ mod tests {
     }
 
     #[test]
+    fn values_encode_as_the_byte_by_byte_writer_did() {
+        // The encoder before it wrote straight into the message buffer.
+        fn reference(variant: Variant, value: &str) -> Vec<u8> {
+            let mut bytes = Vec::new();
+            for c in value.chars() {
+                match c as u32 {
+                    n @ 0xF780..=0xF7FF => bytes.push((n - RAW_BYTE_BASE) as u8),
+                    _ => bytes.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes()),
+                }
+            }
+            let quoted = variant == Variant::MostWanted && bytes.iter().any(|&b| b == b' ' || b == b',');
+            let mut out = Vec::new();
+            if quoted {
+                out.push(b'"');
+            }
+            for (i, b) in bytes.into_iter().enumerate() {
+                let escaped = b < 0x20 || b == 0x7f || b == b'%' || match variant {
+                    Variant::Underground2 => i == 0 && b == b'"',
+                    Variant::MostWanted => b == b'"' || b == b'=',
+                };
+                if escaped {
+                    out.extend_from_slice(format!("%{:02x}", b).as_bytes());
+                } else {
+                    out.push(b);
+                }
+            }
+            if quoted {
+                out.push(b'"');
+            }
+            out
+        }
+        let all_ascii: String = (0u8..0x80).map(char::from).collect();
+        let values = [
+            String::new(),
+            all_ascii,
+            "\"lead".into(),
+            "mid\"quote".into(),
+            "a,b c=d%e".into(),
+            "ééé ü€".into(),
+            decode_value(b"caf%e9%ff%80"),
+            decode_value(b"%ef%9e%80 raw"),
+        ];
+        for variant in Variant::ALL {
+            for value in &values {
+                let mut out = Vec::new();
+                encode_value_into(&mut out, variant, value);
+                assert_eq!(out, reference(variant, value), "{variant:?} {value:?}");
+            }
+        }
+        // The header's length covers the whole message.
+        let message = encode_for(Variant::MostWanted, b"test", b"stat", &[("K", "a b".into()), ("E", String::new())]);
+        assert_eq!(message, b"teststat\0\0\0\x18K=\"a b\"\nE=\n\0");
+    }
+
+    #[test]
+    fn frames_are_read_in_place_one_after_another() {
+        let mut buf = encode(b"one\0", &[0; 4], &[("A", "1".into())]);
+        buf.extend(encode(b"two\0", &[0; 4], &[("B", "2".into())]));
+        buf.extend_from_slice(b"thr");
+        let (first, len) = next_frame(&buf).unwrap().unwrap();
+        assert_eq!((&first.command, first.get("A").as_deref()), (b"one\0", Some("1")));
+        let (second, len2) = next_frame(&buf[len..]).unwrap().unwrap();
+        assert_eq!((&second.command, second.get("B").as_deref()), (b"two\0", Some("2")));
+        assert!(matches!(next_frame(&buf[len + len2..]), Ok(None)));
+    }
+
+    #[test]
     fn invalid_frame_lengths_are_rejected() {
         let mut short = b"news\0\0\0\0\0\0\0\x05abc".to_vec();
         assert!(next_frame(&mut short).is_err());
@@ -754,7 +846,7 @@ mod tests {
         flush_stats(&mut shared);
         let mut stats = rx.try_iter().collect::<Vec<_>>();
         assert_eq!(stats.len(), 1);
-        let msg = decode(&mut stats.remove(0)).unwrap();
+        let msg = decode(&mut stats.remove(0).to_vec()).unwrap();
         assert_eq!(&msg.command, b"+sst");
         assert_eq!(msg.get("UIL").as_deref(), Some("1"));
         assert_eq!(players_online(Variant::Underground2), 1);
@@ -820,7 +912,7 @@ mod tests {
         send(&mut shared, b"addr", "ADDR=192.168.1.189\nPORT=34956");
         send(&mut shared, b"pers", "PERS=pc\nMAC=$fc6d77d9498c");
         // `addr` is answered with nothing (an empty frame).
-        let sent: Vec<Message> = rx.try_iter().filter_map(|mut data| decode(&mut data)).collect();
+        let sent: Vec<Message> = rx.try_iter().filter_map(|data| decode(&mut data.to_vec())).collect();
         let pers = sent.iter().find(|m| &m.command == b"pers").unwrap();
         let who = sent.iter().find(|m| &m.command == b"+who").unwrap();
         for record in [pers, who] {
@@ -833,8 +925,8 @@ mod tests {
     fn both_games_get_their_own_lobby() {
         let log = crate::test_log();
         let mut shared = Shared::new(Filter::Off, &Variant::ALL);
-        let mut inbox: HashMap<ClientId, mpsc::Receiver<Vec<u8>>> = HashMap::new();
-        let login = |shared: &mut Shared, inbox: &mut HashMap<ClientId, mpsc::Receiver<Vec<u8>>>, prod: &str, name: &str| {
+        let mut inbox: HashMap<ClientId, mpsc::Receiver<Packet>> = HashMap::new();
+        let login = |shared: &mut Shared, inbox: &mut HashMap<ClientId, mpsc::Receiver<Packet>>, prod: &str, name: &str| {
             let id = shared.connect("192.168.1.10".into());
             let (tx, rx) = mpsc::channel();
             shared.writers.insert(id, tx);
@@ -867,8 +959,8 @@ mod tests {
         let peer: SocketAddr = "192.168.1.10:1000".parse().unwrap();
         let chat = Message { command: *b"mesg", body: b"TEXT=hello\0".to_vec() };
         answer_lobby(&mut shared, mw, peer, &chat, &log, "test");
-        assert!(inbox[&u2].try_iter().all(|mut m| decode(&mut m).map_or(true, |m| &m.command != b"+msg")));
-        assert!(inbox[&mw].try_iter().any(|mut m| decode(&mut m).is_some_and(|m| &m.command == b"+msg")));
+        assert!(inbox[&u2].try_iter().all(|m| decode(&mut m.to_vec()).map_or(true, |m| &m.command != b"+msg")));
+        assert!(inbox[&mw].try_iter().any(|m| decode(&mut m.to_vec()).is_some_and(|m| &m.command == b"+msg")));
         // A client with an unknown PROD stays in the first lobby.
         let other = login(&mut shared, &mut inbox, "something-else", "other");
         assert_eq!(shared.lobby(other).variant(), Variant::Underground2);

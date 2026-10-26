@@ -224,11 +224,14 @@ impl Lobby {
         if set.host == id || set.members.is_empty() {
             return self.delete_userset(ident);
         }
-        let mut out: Vec<Outgoing> = self
-            .followers(ident)
-            .into_iter()
-            .map(|(to, slot)| self.reply(to, b"+usm", &OK, &[("I", id.to_string()), ("S", slot.to_string())]))
-            .collect();
+        // Followers in the same slot get the same message.
+        let mut gone: [Option<Packet>; 4] = Default::default();
+        let mut out = Vec::new();
+        for (to, slot) in self.followers(ident) {
+            let data = gone[slot]
+                .get_or_insert_with(|| self.packet(b"+usm", &OK, &[("I", id.to_string()), ("S", slot.to_string())]));
+            out.push(Outgoing { to, data: data.clone() });
+        }
         out.extend(self.userset_updates(ident));
         out
     }
@@ -241,7 +244,8 @@ impl Lobby {
                 p.userset_slots[*slot] = 0;
             }
         }
-        followers.into_iter().map(|(to, _)| self.reply(to, b"+ust", &OK, &[("I", ident.to_string())])).collect()
+        let removal = self.packet(b"+ust", &OK, &[("I", ident.to_string())]);
+        followers.into_iter().map(|(to, _)| Outgoing { to, data: removal.clone() }).collect()
     }
 
     pub(super) fn leave_usersets(&mut self, id: ClientId) -> Vec<Outgoing> {
@@ -260,7 +264,7 @@ impl Lobby {
             let ident = self.usersets.values().find(|s| s.name.eq_ignore_ascii_case(&name)).map(|s| s.ident);
             self.follow(id, Some(slot), ident.unwrap_or(0));
             if let Some(ident) = ident {
-                out.extend(self.userset_updates(ident).into_iter().filter(|o| o.to == id));
+                out.extend(self.userset_updates_for(ident, id));
             }
         }
         out
@@ -290,27 +294,45 @@ impl Lobby {
     }
 
     /// `+ust` and the member list for every follower of set `ident`.
+    /// Followers in the same slot get the same messages, encoded once.
     fn userset_updates(&self, ident: u32) -> Vec<Outgoing> {
         let Some(set) = self.usersets.get(&ident) else { return Vec::new() };
+        let mut by_slot: [Option<Vec<Packet>>; 4] = Default::default();
         let mut out = Vec::new();
         for (to, slot) in self.followers(ident) {
-            out.push(self.reply(to, b"+ust", &OK, &self.userset_record(set)));
-            for member in &set.members {
-                let aux = self.players.get(member).map(|p| p.aux.clone()).unwrap_or_default();
-                out.push(self.reply(
-                    to,
-                    b"+usm",
-                    &OK,
-                    &[
-                        ("I", member.to_string()),
-                        ("N", self.persona(*member)),
-                        ("F", String::new()),
-                        ("G", self.game_of(*member).unwrap_or(0).to_string()),
-                        ("X", aux),
-                        ("S", slot.to_string()),
-                    ],
-                ));
-            }
+            let packets = by_slot[slot].get_or_insert_with(|| self.userset_packets(set, slot));
+            out.extend(packets.iter().map(|data| Outgoing { to, data: data.clone() }));
+        }
+        out
+    }
+
+    /// `userset_updates` for `to` alone, without encoding anyone else's.
+    fn userset_updates_for(&self, ident: u32, to: ClientId) -> Vec<Outgoing> {
+        let (Some(set), Some(player)) = (self.usersets.get(&ident), self.players.get(&to)) else {
+            return Vec::new();
+        };
+        // The slot `followers` would report: the first that follows the set.
+        let Some(slot) = player.userset_slots.iter().position(|s| *s == ident) else { return Vec::new() };
+        self.userset_packets(set, slot).into_iter().map(|data| Outgoing { to, data }).collect()
+    }
+
+    /// `+ust` and one `+usm` per member of `set`, for a follower in `slot`.
+    fn userset_packets(&self, set: &UserSet, slot: usize) -> Vec<Packet> {
+        let mut out = vec![self.packet(b"+ust", &OK, &self.userset_record(set))];
+        for member in &set.members {
+            let aux = self.players.get(member).map(|p| p.aux.clone()).unwrap_or_default();
+            out.push(self.packet(
+                b"+usm",
+                &OK,
+                &[
+                    ("I", member.to_string()),
+                    ("N", self.persona(*member)),
+                    ("F", String::new()),
+                    ("G", self.game_of(*member).unwrap_or(0).to_string()),
+                    ("X", aux),
+                    ("S", slot.to_string()),
+                ],
+            ));
         }
         out
     }
@@ -326,7 +348,7 @@ mod tests {
     }
 
     fn answer(out: &[Outgoing]) -> Message {
-        decode(&mut out[0].data.clone()).unwrap()
+        decode(&mut out[0].data.to_vec()).unwrap()
     }
 
     /// The status code in the frame header.
@@ -402,7 +424,7 @@ mod tests {
         let commands: Vec<[u8; 4]> = out.iter().map(|o| o.data[..4].try_into().unwrap()).collect();
         assert_eq!(commands, vec![*b"+uss", *b"usea"]);
         assert_eq!(answer(&out).get("N").unwrap(), "g");
-        assert_eq!(decode(&mut out[1].data.clone()).unwrap().get("COUNT").unwrap(), "1");
+        assert_eq!(decode(&mut out[1].data.to_vec()).unwrap().get("COUNT").unwrap(), "1");
         // A mask the set doesn't satisfy, and a START past the end, find nothing.
         assert_eq!(search(&mut lobby, "CUSTFLAGS=4\nCUSTMASK=4").len(), 1);
         assert_eq!(search(&mut lobby, "START=1").len(), 1);
@@ -418,24 +440,49 @@ mod tests {
             out.iter().map(|o| (o.to, o.data[..4].try_into().unwrap())).collect()
         };
         assert_eq!(tags(&created), vec![(host, *b"ucre"), (host, *b"+ust"), (host, *b"+usm")]);
-        let member = decode(&mut created[2].data.clone()).unwrap();
+        let member = decode(&mut created[2].data.to_vec()).unwrap();
         assert_eq!((member.get("N").unwrap().as_str(), member.get("S").unwrap().as_str()), ("ALICE", "0"));
         // The guest follows the set in slot 1 through sele, then joins.
         let followed = lobby.select(guest, &msg(b"sele", "USERSET1=g"));
         assert_eq!(tags(&followed), vec![(guest, *b"+ust"), (guest, *b"+usm")]);
         let joined = lobby.handle(guest, &msg(b"ujoi", "NAME=g")).unwrap();
         let to_host: Vec<Message> =
-            joined.iter().filter(|o| o.to == host && &o.data[..4] == b"+usm").map(|o| decode(&mut o.data.clone()).unwrap()).collect();
+            joined.iter().filter(|o| o.to == host && &o.data[..4] == b"+usm").map(|o| decode(&mut o.data.to_vec()).unwrap()).collect();
         assert_eq!(to_host.iter().map(|m| m.get("N").unwrap()).collect::<Vec<_>>(), vec!["ALICE", "BOB"]);
         let to_guest = joined.iter().filter(|o| o.to == guest && &o.data[..4] == b"+usm").last().unwrap();
-        assert_eq!(decode(&mut to_guest.data.clone()).unwrap().get("S").unwrap(), "1");
+        assert_eq!(decode(&mut to_guest.data.to_vec()).unwrap().get("S").unwrap(), "1");
         // Leaving tells the host the guest is gone.
         let left = lobby.handle(guest, &msg(b"ulea", "NAME=g")).unwrap();
         let gone = left.iter().find(|o| o.to == host && &o.data[..4] == b"+usm").unwrap();
-        assert_eq!(decode(&mut gone.data.clone()).unwrap().get("N"), None);
+        assert_eq!(decode(&mut gone.data.to_vec()).unwrap().get("N"), None);
         // The host leaving removes the set for its followers.
         let ended = lobby.leave(host);
         assert!(ended.iter().any(|o| o.to == guest && &o.data[..4] == b"+ust"));
+    }
+
+    #[test]
+    fn sele_gets_what_the_broadcast_would_send_it() {
+        let (mut lobby, host) = lobby_with_persona();
+        let others: Vec<ClientId> = (0..5)
+            .map(|i| {
+                let id = lobby.join(format!("b{i}"));
+                lobby.claim_persona(id, &format!("P{i}"));
+                id
+            })
+            .collect();
+        lobby.handle(host, &msg(b"ucre", "NAME=g\nSIZE=8\nUPDATES=0"));
+        for (i, &id) in others.iter().enumerate() {
+            lobby.handle(id, &msg(b"ujoi", &format!("NAME=g\nUPDATES={}", i % 4)));
+            lobby.handle(id, &msg(b"auxi", &format!("TEXT=car{i}")));
+        }
+        // Following a set again in a later slot keeps reporting the first.
+        let newcomer = others[1];
+        let targeted = lobby.select(newcomer, &msg(b"sele", "USERSET3=g"));
+        let broadcast: Vec<Outgoing> = lobby.userset_updates(1).into_iter().filter(|o| o.to == newcomer).collect();
+        assert_eq!(targeted.len(), 1 + 6);
+        let bytes = |out: &[Outgoing]| out.iter().map(|o| (o.to, o.data.to_vec())).collect::<Vec<_>>();
+        assert_eq!(bytes(&targeted), bytes(&broadcast));
+        assert_eq!(answer(&targeted[1..]).get("S").as_deref(), Some("1"));
     }
 
     #[test]
@@ -445,14 +492,14 @@ mod tests {
         player.addr = "192.168.1.189".into();
         player.local_addr = "192.168.1.189".into();
         player.mac = "$fc6d77d9498c".into();
-        let who = decode(&mut lobby.who(id).unwrap().data).unwrap();
+        let who = decode(&mut lobby.who(id).unwrap().data.to_vec()).unwrap();
         assert_eq!(who.get("A").as_deref(), Some("192.168.1.189"));
         assert_eq!(who.get("LA").as_deref(), Some("192.168.1.189"));
         assert_eq!(who.get("MA").as_deref(), Some("$fc6d77d9498c"));
         // Underground 2's record is unchanged.
         let mut u2 = Lobby::default();
         let other = u2.join("192.168.1.189".into());
-        assert_eq!(decode(&mut u2.who(other).unwrap().data).unwrap().get("LA"), None);
+        assert_eq!(decode(&mut u2.who(other).unwrap().data.to_vec()).unwrap().get("LA"), None);
     }
 
     #[test]
