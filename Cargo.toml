@@ -1,6 +1,6 @@
 [package]
-name = "nfsu2-server"
-version = "0.1.0"
+name = "nfs-lan-server"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]

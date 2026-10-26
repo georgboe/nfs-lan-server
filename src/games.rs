@@ -66,7 +66,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::lobby::{encode, Message};
+use crate::lobby::{encode_for, Message};
+
+#[path = "games/usersets.rs"]
+mod usersets;
 
 const OK: [u8; 4] = [0; 4];
 const NOT_FOUND: [u8; 4] = *b"nfnd";
@@ -101,6 +104,32 @@ const SEARCH_DEFAULT_MAX_SIZE: u32 = 8;
 
 pub(crate) type ClientId = u32;
 
+/// Which game a lobby speaks to. Most Wanted's userset commands (`u...`,
+/// `sele USERSETn`) are only answered for Most Wanted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub(crate) enum Variant {
+    #[default]
+    Underground2,
+    MostWanted,
+}
+
+impl Variant {
+    pub const ALL: [Variant; 2] = [Variant::Underground2, Variant::MostWanted];
+
+    /// The game a client is, from the PROD it sends in `@dir` and `auth`.
+    pub fn from_product(prod: &str) -> Option<Variant> {
+        match prod {
+            "nfs-pc-2005" => Some(Variant::Underground2),
+            "nfs-pc-2006" => Some(Variant::MostWanted),
+            _ => None,
+        }
+    }
+
+    pub fn index(self) -> usize {
+        self as usize
+    }
+}
+
 /// A message for one client.
 pub(crate) struct Outgoing {
     pub to: ClientId,
@@ -114,6 +143,8 @@ pub(crate) struct Player {
     pub addr: String,
     /// Address the client reports for itself in `addr`.
     pub local_addr: String,
+    /// Most Wanted's machine address: the MAC (`$hex`) from `auth`/`pers`.
+    pub mac: String,
     /// The client's current `gsea` filter, if it is browsing games.
     pub search: Option<Search>,
     /// Games currently in this client's browser list.
@@ -126,6 +157,8 @@ pub(crate) struct Player {
     pub wants_game_updates: bool,
     /// The stats last sent to this client.
     last_stats: Option<Stats>,
+    /// The usersets whose updates this client follows, by slot (0 = none).
+    userset_slots: [u32; 4],
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -196,17 +229,26 @@ impl std::str::FromStr for Filter {
 /// Flag sets are sent as letters, one per set bit (EA's "%f" format; bit 0 is
 /// '@', bit 1 'A', ...), as in SPEED2.EXE's FUN_00741760/FUN_00742100.
 const FLAG_LETTERS: &[u8] = b"@ABCDEFGHIJKLMNOPQRSTUVWXYZ0123";
+/// Most Wanted's server.dll adds '-' for bit 31 (FUN_100024f0). Circuit
+/// usersets set it, so without it their CUSTFLAGS never match a search.
+const FLAG_LETTERS_MW: &[u8] = b"@ABCDEFGHIJKLMNOPQRSTUVWXYZ0123-";
 /// `+msg` flag the game shows as a private message.
 const MSG_PRIVATE: u32 = 0x10000;
 
-fn decode_flags(text: &str) -> u32 {
-    text.bytes()
-        .filter_map(|b| FLAG_LETTERS.iter().position(|&l| l == b))
-        .fold(0, |flags, bit| flags | 1 << bit)
+fn flag_letters(variant: Variant) -> &'static [u8] {
+    match variant {
+        Variant::Underground2 => FLAG_LETTERS,
+        Variant::MostWanted => FLAG_LETTERS_MW,
+    }
 }
 
-fn encode_flags(flags: u32) -> String {
-    FLAG_LETTERS
+fn decode_flags(variant: Variant, text: &str) -> u32 {
+    let letters = flag_letters(variant);
+    text.bytes().filter_map(|b| letters.iter().position(|&l| l == b)).fold(0, |flags, bit| flags | 1 << bit)
+}
+
+fn encode_flags(variant: Variant, flags: u32) -> String {
+    flag_letters(variant)
         .iter()
         .enumerate()
         .filter(|(bit, _)| flags & (1 << bit) != 0)
@@ -292,8 +334,13 @@ impl Game {
 #[derive(Default)]
 pub(crate) struct Lobby {
     filter: Filter,
+    variant: Variant,
     players: HashMap<ClientId, Player>,
     games: BTreeMap<u32, Game>,
+    usersets: BTreeMap<u32, usersets::UserSet>,
+    next_userset: u32,
+    /// Ids for `join`; the server hands out ids itself (`join_as`).
+    #[cfg(test)]
     next_client: ClientId,
     next_game: u32,
 }
@@ -323,24 +370,56 @@ fn seed() -> u32 {
         .unwrap_or(1)
 }
 
-fn reply(to: ClientId, command: &[u8; 4], status: &[u8; 4], fields: &[(&str, String)]) -> Outgoing {
-    Outgoing { to, data: encode(command, status, fields) }
-}
 
-fn error(to: ClientId, command: &[u8; 4], status: [u8; 4]) -> Vec<Outgoing> {
-    vec![reply(to, command, &status, &[])]
+/// A message for `to` encoded for `variant`, for loops that hold the lobby
+/// mutably (`Lobby::reply` otherwise).
+fn reply_as(variant: Variant, to: ClientId, command: &[u8; 4], status: &[u8; 4], fields: &[(&str, String)]) -> Outgoing {
+    Outgoing { to, data: encode_for(variant, command, status, fields) }
 }
 
 impl Lobby {
+    /// A message for `to`, encoded for this lobby's game.
+    fn reply(&self, to: ClientId, command: &[u8; 4], status: &[u8; 4], fields: &[(&str, String)]) -> Outgoing {
+        reply_as(self.variant, to, command, status, fields)
+    }
+
+    fn error(&self, to: ClientId, command: &[u8; 4], status: [u8; 4]) -> Vec<Outgoing> {
+        vec![self.reply(to, command, &status, &[])]
+    }
+
     pub fn new(filter: Filter) -> Lobby {
         Lobby { filter, ..Lobby::default() }
     }
 
+    pub fn with_variant(self, variant: Variant) -> Lobby {
+        Lobby { variant, ..self }
+    }
+
+    pub fn variant(&self) -> Variant {
+        self.variant
+    }
+
+    #[cfg(test)]
     pub fn join(&mut self, addr: String) -> ClientId {
         self.next_client += 1;
         let id = self.next_client;
-        self.players.insert(id, Player { addr, ..Player::default() });
+        self.join_as(id, addr);
         id
+    }
+
+    /// Adds a client under an id chosen elsewhere (unique across lobbies).
+    pub fn join_as(&mut self, id: ClientId, addr: String) {
+        self.players.insert(id, Player { addr, ..Player::default() });
+    }
+
+    /// Takes a client that hasn't logged in out of this lobby, to move it to
+    /// its game's lobby.
+    pub fn hand_over(&mut self, id: ClientId) -> Option<Player> {
+        self.players.remove(&id)
+    }
+
+    pub fn take_over(&mut self, id: ClientId, player: Player) {
+        self.players.insert(id, player);
     }
 
     pub fn player_mut(&mut self, id: ClientId) -> Option<&mut Player> {
@@ -371,7 +450,8 @@ impl Lobby {
 
     /// Removes a disconnected client from its games and the lobby.
     pub fn leave(&mut self, id: ClientId) -> Vec<Outgoing> {
-        let out = self.leave_games(id);
+        let mut out = self.leave_usersets(id);
+        out.extend(self.leave_games(id));
         self.players.remove(&id);
         out
     }
@@ -412,6 +492,8 @@ impl Lobby {
             ["LADDR0", "LADDR1", "LADDR2", "LADDR3", "LADDR4", "LADDR5", "LADDR6", "LADDR7"];
         const OPFLAG: [&str; 8] =
             ["OPFLAG0", "OPFLAG1", "OPFLAG2", "OPFLAG3", "OPFLAG4", "OPFLAG5", "OPFLAG6", "OPFLAG7"];
+        const MADDR: [&str; 8] =
+            ["MADDR0", "MADDR1", "MADDR2", "MADDR3", "MADDR4", "MADDR5", "MADDR6", "MADDR7"];
         // Sizes are capped at MAX_PLAYERS, so COUNT never exceeds the entries.
         for (i, id) in game.players.iter().take(OPID.len()).enumerate() {
             let player = self.players.get(id);
@@ -424,6 +506,12 @@ impl Lobby {
             fields.push((ADDR[i], addr));
             fields.push((LADDR[i], local));
             fields.push((OPFLAG[i], signed(game.flags.get(id).copied().unwrap_or(0))));
+            // Most Wanted names peers by machine address when it connects
+            // them (speed.exe FUN_0079a5c0); without it the game makes one up.
+            let mac = player.map(|p| p.mac.clone()).unwrap_or_default();
+            if self.variant == Variant::MostWanted && !mac.is_empty() {
+                fields.push((MADDR[i], mac));
+            }
         }
         fields
     }
@@ -432,29 +520,50 @@ impl Lobby {
     pub fn who(&self, id: ClientId) -> Option<Outgoing> {
         let player = self.players.get(&id)?;
         let game = self.game_of(id).unwrap_or(0);
-        Some(reply(
-            id,
-            b"+who",
-            &OK,
-            &[
-                ("I", id.to_string()),
-                ("N", player.persona.clone()),
-                ("F", "0".to_string()),
-                ("A", player.addr.clone()),
-                ("X", player.aux.clone()),
-                ("G", game.to_string()),
-                ("R", "0".to_string()),
-                ("RI", "0".to_string()),
-            ],
-        ))
+        let mut fields = vec![
+            ("I", id.to_string()),
+            ("N", player.persona.clone()),
+            ("F", "0".to_string()),
+            ("A", player.addr.clone()),
+            ("X", player.aux.clone()),
+            ("G", game.to_string()),
+            ("R", "0".to_string()),
+            ("RI", "0".to_string()),
+        ];
+        fields.extend(self.machine_addresses(player));
+        Some(self.reply(id, b"+who", &OK, &fields))
+    }
+
+    /// Most Wanted's LA (local address) and MA (machine address) user record
+    /// keys. The game rebuilds its own record from every `+who`, clearing it
+    /// first (speed.exe FUN_00845bf0 -> FUN_00845a40), and names its peer
+    /// session after each player's A and LA ("$%08x$%08x", FUN_0085bc60). A
+    /// `+who` without LA leaves the client's LA at 0 while the other side
+    /// takes it from the game record's LADDR, so the two compute different
+    /// session ids and never connect.
+    fn machine_addresses(&self, player: &Player) -> Vec<(&'static str, String)> {
+        if self.variant != Variant::MostWanted {
+            return Vec::new();
+        }
+        let local = if player.local_addr.is_empty() { player.addr.clone() } else { player.local_addr.clone() };
+        let mut fields = vec![("LA", local)];
+        if !player.mac.is_empty() {
+            fields.push(("MA", player.mac.clone()));
+        }
+        fields
     }
 
     /// Applies a `sele` request to the client's subscriptions.
-    pub fn select(&mut self, id: ClientId, msg: &Message) {
+    /// Returns the userset member lists a `USERSETn` key subscribed to.
+    pub fn select(&mut self, id: ClientId, msg: &Message) -> Vec<Outgoing> {
         if let Some(p) = self.players.get_mut(&id) {
             p.wants_stats = switch(msg, "STATS", p.wants_stats);
             p.wants_messages = switch(msg, "MESGS", p.wants_messages);
             p.wants_game_updates = switch(msg, "MYGAME", p.wants_game_updates);
+        }
+        match self.variant {
+            Variant::MostWanted => self.select_usersets(id, msg),
+            Variant::Underground2 => Vec::new(),
         }
     }
 
@@ -485,13 +594,15 @@ impl Lobby {
     /// `+sst` for every client that wants stats and hasn't seen the current ones.
     pub fn stats_updates(&mut self) -> Vec<Outgoing> {
         let stats = self.stats();
+        let variant = self.variant;
         let mut out = Vec::new();
         for (id, player) in self.players.iter_mut() {
             if !player.wants_stats || player.last_stats == Some(stats) {
                 continue;
             }
             player.last_stats = Some(stats);
-            out.push(reply(
+            out.push(reply_as(
+                variant,
                 *id,
                 b"+sst",
                 &OK,
@@ -509,7 +620,7 @@ impl Lobby {
     }
 
     fn game_message(&self, command: &[u8; 4], game: &Game, to: ClientId) -> Outgoing {
-        reply(to, command, &OK, &self.record(game, to))
+        self.reply(to, command, &OK, &self.record(game, to))
     }
 
     /// Brings every browser's list up to date with game `ident`: `+gam` where
@@ -529,7 +640,7 @@ impl Lobby {
             }
         }
         let mut out: Vec<Outgoing> = shown.iter().map(|to| self.game_message(b"+gam", game, *to)).collect();
-        out.extend(hidden.iter().map(|to| reply(*to, b"+gam", &OK, &[("IDENT", ident.to_string())])));
+        out.extend(hidden.iter().map(|to| self.reply(*to, b"+gam", &OK, &[("IDENT", ident.to_string())])));
         for id in shown {
             self.players.get_mut(&id).expect("player exists").visible.insert(ident);
         }
@@ -541,10 +652,11 @@ impl Lobby {
 
     /// A `+gam` without NAME for every browser listing game `ident`.
     fn announce_removed(&mut self, ident: u32) -> Vec<Outgoing> {
+        let variant = self.variant;
         let mut out = Vec::new();
         for (id, player) in self.players.iter_mut() {
             if player.visible.remove(&ident) {
-                out.push(reply(*id, b"+gam", &OK, &[("IDENT", ident.to_string())]));
+                out.push(reply_as(variant, *id, b"+gam", &OK, &[("IDENT", ident.to_string())]));
             }
         }
         out
@@ -602,7 +714,7 @@ impl Lobby {
             // Everyone who was in it, the leaver included, learns it's gone.
             let former = game.players.iter().copied().chain([id]);
             for member in former.filter(|m| self.wants_game_updates(*m)) {
-                out.push(reply(member, b"+mgm", &OK, &[("IDENT", ident.to_string())]));
+                out.push(self.reply(member, b"+mgm", &OK, &[("IDENT", ident.to_string())]));
             }
         } else {
             out.extend(self.notify_members(game, None));
@@ -621,7 +733,7 @@ impl Lobby {
                 p.search = None;
                 p.visible.clear();
             }
-            return vec![reply(id, b"gsea", &OK, &[])];
+            return vec![self.reply(id, b"gsea", &OK, &[])];
         }
         let search = Search::from_message(msg);
         let found: Vec<u32> = self
@@ -632,7 +744,7 @@ impl Lobby {
             .take(search.count)
             .map(|g| g.ident)
             .collect();
-        let mut out = vec![reply(id, b"gsea", &OK, &[("COUNT", found.len().to_string())])];
+        let mut out = vec![self.reply(id, b"gsea", &OK, &[("COUNT", found.len().to_string())])];
         out.extend(found.iter().map(|ident| self.game_message(b"+gam", &self.games[ident], id)));
         if let Some(p) = self.players.get_mut(&id) {
             p.search = Some(search);
@@ -646,22 +758,25 @@ impl Lobby {
         let maxsize = msg.get("MAXSIZE").and_then(|v| number(&v));
         let minsize = msg.get("MINSIZE").and_then(|v| number(&v));
         let (Some(maxsize), Some(minsize)) = (maxsize, minsize) else {
-            return error(id, b"gcre", MISSING);
+            return self.error(id, b"gcre", MISSING);
         };
         if name.is_empty() {
-            return error(id, b"gcre", MISSING);
+            return self.error(id, b"gcre", MISSING);
         }
         let numpart = msg.get("NUMPART").and_then(|v| number(&v)).unwrap_or(1);
         // Sizes compare as signed values in server.dll.
         let (max, min) = (maxsize as i32, minsize as i32);
         if !(1..=MAX_PLAYERS as i32).contains(&max) || min < 1 || max < min || !(1..=2).contains(&numpart) {
-            return error(id, b"gcre", INVALID);
+            return self.error(id, b"gcre", INVALID);
         }
-        if self.find_game_named(&name).is_some() {
-            return error(id, b"gcre", DUPLICATE);
+        if let Some(ident) = self.find_game_named(&name) {
+            if self.variant == Variant::MostWanted && self.games[&ident].host == id {
+                return self.reopen(ident, msg);
+            }
+            return self.error(id, b"gcre", DUPLICATE);
         }
         if self.game_of(id).is_some() {
-            return error(id, b"gcre", IN_GAME);
+            return self.error(id, b"gcre", IN_GAME);
         }
         let mut out = Vec::new();
         self.next_game += 1;
@@ -684,30 +799,63 @@ impl Lobby {
         out.push(self.game_message(b"gcre", &game, id));
         self.games.insert(ident, game);
         out.extend(self.who(id));
+        out.extend(self.member_updates(id));
         out.extend(self.notify_members(&self.games[&ident], None));
         out.extend(self.announce(ident));
         out
     }
 
+    /// Most Wanted's host re-creates its game under the same name after a
+    /// race while it and the other racers are still in it (they re-join the
+    /// same name). The game is refreshed from the request and keeps its
+    /// members, instead of failing as a duplicate.
+    fn reopen(&mut self, ident: u32, msg: &Message) -> Vec<Outgoing> {
+        let game = self.games.get_mut(&ident).expect("game exists");
+        let number_or = |key: &str, old: u32| msg.get(key).and_then(|v| number(&v)).unwrap_or(old);
+        game.minsize = number_or("MINSIZE", game.minsize);
+        game.maxsize = number_or("MAXSIZE", game.maxsize);
+        game.custflags = number_or("CUSTFLAGS", game.custflags);
+        game.sysflags = number_or("SYSFLAGS", game.sysflags) & !SYSFLAG_STARTED;
+        if let Some(params) = msg.get("PARAMS") {
+            game.params = params;
+        }
+        game.started = false;
+        let host = game.host;
+        let game = &self.games[&ident];
+        let mut out = vec![self.game_message(b"gcre", game, host)];
+        out.extend(self.who(host));
+        out.extend(self.notify_members(game, None));
+        out.extend(self.announce(ident));
+        out
+    }
+
+    /// A race report (`rank`) means the sender's race is over: the game goes
+    /// back to waiting so its members can re-join and race again.
+    pub(super) fn end_race(&mut self, id: ClientId) {
+        if let Some(ident) = self.game_of(id) {
+            self.games.get_mut(&ident).expect("game exists").started = false;
+        }
+    }
+
     fn join_game(&mut self, id: ClientId, msg: &Message) -> Vec<Outgoing> {
         let Some(ident) = self.find_game(msg) else {
-            return error(id, b"gjoi", NOT_FOUND);
+            return self.error(id, b"gjoi", NOT_FOUND);
         };
         let game = &self.games[&ident];
         if game.players.contains(&id) {
             return vec![self.game_message(b"gjoi", game, id)];
         }
         if game.sysflags() & SYSFLAG_LOCKED != 0 {
-            return error(id, b"gjoi", LOCKED);
+            return self.error(id, b"gjoi", LOCKED);
         }
         if game.started {
-            return error(id, b"gjoi", ALREADY_STARTED);
+            return self.error(id, b"gjoi", ALREADY_STARTED);
         }
         if !game.password.is_empty() && game.password != msg.get("PASS").unwrap_or_default() {
-            return error(id, b"gjoi", *b"pass");
+            return self.error(id, b"gjoi", *b"pass");
         }
         if game.players.len() as u32 >= game.maxsize.min(MAX_PLAYERS) {
-            return error(id, b"gjoi", FULL);
+            return self.error(id, b"gjoi", FULL);
         }
         let mut out = self.leave_games(id);
         let flags = msg.get("USERFLAGS").and_then(|v| number(&v)).unwrap_or(0);
@@ -717,6 +865,7 @@ impl Lobby {
         let game = &self.games[&ident];
         out.push(self.game_message(b"gjoi", game, id));
         out.extend(self.who(id));
+        out.extend(self.member_updates(id));
         out.extend(self.notify_members(game, None));
         out.extend(self.announce(ident));
         out
@@ -724,15 +873,15 @@ impl Lobby {
 
     fn set_game(&mut self, id: ClientId, msg: &Message) -> Vec<Outgoing> {
         let Some(ident) = self.target_game(id, msg) else {
-            return error(id, b"gset", NO_SUCH_GAME);
+            return self.error(id, b"gset", NO_SUCH_GAME);
         };
         let game = &self.games[&ident];
         if !game.players.contains(&id) {
-            return error(id, b"gset", NOT_IN_GAME);
+            return self.error(id, b"gset", NOT_IN_GAME);
         }
         let host_only = ["PARAMS", "CUSTFLAGS", "SYSFLAGS", "KICK"];
         if game.host != id && host_only.iter().any(|key| msg.get(key).is_some()) {
-            return error(id, b"gset", NOT_HOST);
+            return self.error(id, b"gset", NOT_HOST);
         }
         // KICK lists personas separated by commas (SPEED2.EXE DAT_007a1598).
         let mut kicked = Vec::new();
@@ -744,7 +893,7 @@ impl Lobby {
                             kicked.push(player);
                         }
                     }
-                    _ => return error(id, b"gset", NOT_FOUND),
+                    _ => return self.error(id, b"gset", NOT_FOUND),
                 }
             }
         }
@@ -784,24 +933,24 @@ impl Lobby {
 
     fn start_game(&mut self, id: ClientId, msg: &Message) -> Vec<Outgoing> {
         let Some(ident) = self.target_game(id, msg) else {
-            return error(id, b"gsta", NO_SUCH_GAME);
+            return self.error(id, b"gsta", NO_SUCH_GAME);
         };
         let game = &self.games[&ident];
         if !game.players.contains(&id) {
-            return error(id, b"gsta", NOT_IN_GAME);
+            return self.error(id, b"gsta", NOT_IN_GAME);
         }
         if game.host != id {
-            return error(id, b"gsta", NOT_HOST);
+            return self.error(id, b"gsta", NOT_HOST);
         }
         if game.started {
-            return error(id, b"gsta", ALREADY_STARTED);
+            return self.error(id, b"gsta", ALREADY_STARTED);
         }
         if (game.players.len() as u32) < game.minsize {
-            return error(id, b"gsta", TOO_FEW_PLAYERS);
+            return self.error(id, b"gsta", TOO_FEW_PLAYERS);
         }
         self.games.get_mut(&ident).expect("game exists").started = true;
         let game = &self.games[&ident];
-        let mut out = vec![reply(id, b"gsta", &OK, &[])];
+        let mut out = vec![self.reply(id, b"gsta", &OK, &[])];
         out.extend(game.players.iter().map(|to| self.game_message(b"+ses", game, *to)));
         // The started flag hides it from normal searches.
         out.extend(self.announce(ident));
@@ -816,18 +965,18 @@ impl Lobby {
             b"gcre" => self.create(id, msg),
             b"gjoi" => self.join_game(id, msg),
             b"gget" => match self.find_game(msg) {
-                None => error(id, b"gget", NOT_FOUND),
+                None => self.error(id, b"gget", NOT_FOUND),
                 Some(ident) => vec![self.game_message(b"gget", &self.games[&ident], id)],
             },
             b"gset" => self.set_game(id, msg),
             b"gsta" => self.start_game(id, msg),
             b"glea" => {
-                let mut out = vec![reply(id, b"glea", &OK, &[])];
+                let mut out = vec![self.reply(id, b"glea", &OK, &[])];
                 out.extend(self.leave_games(id));
                 out
             }
             b"gdel" => {
-                let mut out = vec![reply(id, b"gdel", &OK, &[])];
+                let mut out = vec![self.reply(id, b"gdel", &OK, &[])];
                 if let Some(ident) = self.target_game(id, msg) {
                     if self.games[&ident].host == id {
                         out.extend(self.remove_from_game(ident, id));
@@ -839,52 +988,50 @@ impl Lobby {
                 if let Some(p) = self.players.get_mut(&id) {
                     p.aux = msg.get("TEXT").unwrap_or_default();
                 }
-                let mut out = vec![reply(id, b"auxi", &OK, &[])];
+                let mut out = vec![self.reply(id, b"auxi", &OK, &[])];
                 out.extend(self.who(id));
+                out.extend(self.member_updates(id));
                 out
             }
             b"onln" => {
                 let wanted = msg.get("PERS").unwrap_or_default();
                 match self.find_persona(&wanted) {
-                    None => vec![reply(id, b"onln", &NOT_FOUND, &[("PERS", wanted)])],
+                    None => vec![self.reply(id, b"onln", &NOT_FOUND, &[("PERS", wanted)])],
                     Some(user) => {
                         let player = &self.players[&user];
                         let game = self.game_of(user).unwrap_or(0);
-                        vec![reply(
-                            id,
-                            b"onln",
-                            &OK,
-                            &[
-                                ("PERS", player.persona.clone()),
-                                ("I", user.to_string()),
-                                ("N", player.persona.clone()),
-                                ("F", "0".to_string()),
-                                ("A", player.addr.clone()),
-                                ("X", player.aux.clone()),
-                                ("G", game.to_string()),
-                                ("R", "0".to_string()),
-                            ],
-                        )]
+                        let mut fields = vec![
+                            ("PERS", player.persona.clone()),
+                            ("I", user.to_string()),
+                            ("N", player.persona.clone()),
+                            ("F", "0".to_string()),
+                            ("A", player.addr.clone()),
+                            ("X", player.aux.clone()),
+                            ("G", game.to_string()),
+                            ("R", "0".to_string()),
+                        ];
+                        fields.extend(self.machine_addresses(player));
+                        vec![self.reply(id, b"onln", &OK, &fields)]
                     }
                 }
             }
             b"mesg" => {
                 let text = msg.get("TEXT").unwrap_or_default();
-                let flags = decode_flags(&msg.get("ATTR").unwrap_or_default());
+                let flags = decode_flags(self.variant, &msg.get("ATTR").unwrap_or_default());
                 let sender = self.persona(id);
                 let chat = |to: ClientId, flags: u32| {
-                    reply(
+                    self.reply(
                         to,
                         b"+msg",
                         &OK,
-                        &[("F", encode_flags(flags)), ("N", sender.clone()), ("T", text.clone())],
+                        &[("F", encode_flags(self.variant, flags)), ("N", sender.clone()), ("T", text.clone())],
                     )
                 };
                 match msg.get("PRIV") {
                     Some(target) => match self.find_persona(&target) {
-                        None => error(id, b"mesg", NOT_FOUND),
+                        None => self.error(id, b"mesg", NOT_FOUND),
                         Some(to) => {
-                            let mut out = vec![reply(id, b"mesg", &OK, &[])];
+                            let mut out = vec![self.reply(id, b"mesg", &OK, &[])];
                             if self.players[&to].wants_messages {
                                 out.push(chat(to, flags | MSG_PRIVATE));
                             }
@@ -901,7 +1048,7 @@ impl Lobby {
                                 .map(|(other, _)| *other)
                                 .collect(),
                         };
-                        let mut out = vec![reply(id, b"mesg", &OK, &[])];
+                        let mut out = vec![self.reply(id, b"mesg", &OK, &[])];
                         out.extend(
                             recipients
                                 .into_iter()
@@ -914,7 +1061,7 @@ impl Lobby {
             }
             b"user" => {
                 let pers = msg.get("PERS").unwrap_or_else(|| self.persona(id));
-                vec![reply(
+                vec![self.reply(
                     id,
                     b"user",
                     &OK,
@@ -926,6 +1073,7 @@ impl Lobby {
                     ],
                 )]
             }
+            _ if self.variant == Variant::MostWanted => return self.handle_userset(id, msg),
             _ => return None,
         };
         Some(out)
@@ -1139,9 +1287,14 @@ mod tests {
 
     #[test]
     fn flag_letters_round_trip() {
-        assert_eq!(decode_flags("G"), 0x80);
-        assert_eq!(encode_flags(0x8010020), "EP0");
-        assert_eq!(decode_flags(&encode_flags(0x10084)), 0x10084);
+        let u2 = Variant::Underground2;
+        assert_eq!(decode_flags(u2, "G"), 0x80);
+        assert_eq!(encode_flags(u2, 0x8010020), "EP0");
+        assert_eq!(decode_flags(u2, &encode_flags(u2, 0x10084)), 0x10084);
+        // Bit 31 has a letter only in Most Wanted.
+        assert_eq!(decode_flags(u2, "JKM-"), 0x2c00);
+        assert_eq!(decode_flags(Variant::MostWanted, "JKM-"), 0x8000_2c00);
+        assert_eq!(encode_flags(Variant::MostWanted, 0x8000_2c00), "JKM-");
     }
 
     #[test]
@@ -1165,7 +1318,7 @@ mod tests {
         let private: Vec<_> = out.iter().filter(|o| &parse(o).command == b"+msg").collect();
         assert_eq!(private.len(), 1);
         assert_eq!(private[0].to, ids[0]);
-        assert_eq!(decode_flags(&parse(private[0]).get("F").unwrap()) & MSG_PRIVATE, MSG_PRIVATE);
+        assert_eq!(decode_flags(Variant::Underground2, &parse(private[0]).get("F").unwrap()) & MSG_PRIVATE, MSG_PRIVATE);
     }
 
     #[test]

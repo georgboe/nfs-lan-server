@@ -1,4 +1,4 @@
-//! Server settings, read from an INI file (`nfsu2-server.ini` by default).
+//! Server settings, read from an INI file (`nfs-lan-server.ini` by default).
 //!
 //! The file holds `key = value` lines; `;` and `#` start comments, at the
 //! start of a line or after whitespace. Unknown keys are errors, so a typo
@@ -7,17 +7,22 @@
 use std::fs;
 use std::path::Path;
 
-use crate::games::Filter;
+use crate::games::{Filter, Variant};
 use crate::BEACON_NAME_MAX;
 
-pub(crate) const DEFAULT_PATH: &str = "nfsu2-server.ini";
+pub(crate) const DEFAULT_PATH: &str = "nfs-lan-server.ini";
 
 /// Written when no config file exists; every setting with its default.
 pub(crate) const DEFAULT_INI: &str = "\
-; NFS Underground 2 LAN server settings.
+; NFS LAN server settings (Underground 2 and Most Wanted).
+
+; Which game the server is for: u2 (Underground 2), mw (Most Wanted) or
+; both. With both, each game lists the server and its players get their own
+; lobby: games, chat and stats never mix.
+game = both
 
 ; Name in the game's LAN browser, 1 to 12 bytes.
-name = NFSU2 Server
+name = NFS LAN
 
 ; Which games the join screen lists:
 ;   ea   = like EA's server: race mode, car matching and options must match
@@ -32,6 +37,8 @@ debug_mode = false
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Config {
+    /// The games served; with both, each client's PROD picks its lobby.
+    pub games: Vec<Variant>,
     pub name: String,
     pub filter: Filter,
     pub debug_mode: bool,
@@ -39,7 +46,7 @@ pub(crate) struct Config {
 
 impl Default for Config {
     fn default() -> Config {
-        Config { name: "NFSU2 Server".to_string(), filter: Filter::Off, debug_mode: false }
+        Config { games: Variant::ALL.to_vec(), name: "NFS LAN".to_string(), filter: Filter::Off, debug_mode: false }
     }
 }
 
@@ -71,6 +78,14 @@ pub(crate) fn parse(text: &str) -> Result<Config, String> {
                     return Err(at(format!("name must be 1 to {} bytes, got {:?}", BEACON_NAME_MAX, value)));
                 }
                 config.name = value.to_string();
+            }
+            "game" => {
+                config.games = match value.to_ascii_lowercase().as_str() {
+                    "u2" => vec![Variant::Underground2],
+                    "mw" => vec![Variant::MostWanted],
+                    "both" => Variant::ALL.to_vec(),
+                    _ => return Err(at(format!("game must be u2, mw or both, got {:?}", value))),
+                }
             }
             "filter" => config.filter = value.parse().map_err(at)?,
             "debug_mode" => {
@@ -111,8 +126,10 @@ mod tests {
         assert_eq!(config.name, "Garage");
         assert_eq!(config.filter, Filter::Mode);
         assert!(config.debug_mode);
+        assert_eq!(parse("game = MW").unwrap().games, [Variant::MostWanted]);
+        assert_eq!(parse("game = both").unwrap().games, [Variant::Underground2, Variant::MostWanted]);
         // Unmentioned settings keep their defaults.
-        assert_eq!(parse("filter = off").unwrap().name, "NFSU2 Server");
+        assert_eq!(parse("filter = off").unwrap().name, "NFS LAN");
     }
 
     #[test]
@@ -120,7 +137,7 @@ mod tests {
         assert_eq!(parse("\nfiltr = ea").unwrap_err(), "line 2: unknown setting \"filtr\"");
         assert!(parse("name = A name that is too long").is_err());
         assert!(parse("debug_mode = yes").is_err());
-        assert!(parse("mode = lobby").is_err());
+        assert!(parse("game = nfs3").is_err());
         assert!(parse("just text").is_err());
     }
 }

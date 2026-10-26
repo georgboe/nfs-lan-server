@@ -1,4 +1,5 @@
-//! NFS Underground 2 LAN server: beacon, redirector and lobby (see `lobby`).
+//! NFS LAN server for Underground 2 and Most Wanted: beacon, redirector and
+//! lobby (see `lobby`).
 //! Settings come from an INI file (see `config`).
 //!
 //! With debug_mode on, every byte received or sent is written to a log file
@@ -9,6 +10,7 @@ mod config;
 mod games;
 mod lobby;
 
+use games::Variant;
 use std::collections::HashMap;
 use std::env;
 use std::fs::{self, File};
@@ -41,9 +43,12 @@ pub(crate) const BEACON_TARGET: &str = "255.255.255.255:9999";
 /// SPEED2.EXE FUN_004fb4c0 from the region: "NFSU2NA" or "NFSU2"), so we
 /// send one beacon per tag.
 const BEACON_TAGS: [&str; 2] = ["NFSU2NA", "NFSU2"];
+/// Most Wanted's LAN browser does the same with its own tags (speed.exe
+/// FUN_0064a3d0).
+const BEACON_TAGS_MW: [&str; 2] = ["NFSMWNA", "NFSMW"];
 /// The browser truncates names to 12 characters and then looks the server up
 /// again by that truncated name, so a longer name is never listed.
-const BEACON_NAME: &str = "NFSU2 Server";
+const BEACON_NAME: &str = "NFS LAN";
 pub(crate) const BEACON_NAME_MAX: usize = 12;
 /// How long a client that queried us from its own port keeps getting
 /// beacons sent there (the game's entries expire after ~11 s unrefreshed).
@@ -59,20 +64,35 @@ pub(crate) struct BeaconIdentity {
     pub id: u32,
     /// The redirector port the game connects to.
     pub game_port: u16,
+    /// One beacon is sent per tag, with the racer count of the tag's game.
+    pub tags: Vec<(&'static str, Variant)>,
 }
 
 impl BeaconIdentity {
-    pub fn new(name: &str, game_port: u16) -> BeaconIdentity {
+    pub fn new(name: &str, game_port: u16, tags: Vec<(&'static str, Variant)>) -> BeaconIdentity {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
         let id = now.subsec_nanos() ^ (now.as_secs() as u32).rotate_left(16) ^ std::process::id();
-        BeaconIdentity { name: name.to_string(), id, game_port }
+        BeaconIdentity { name: name.to_string(), id, game_port, tags }
     }
 }
 
 impl Default for BeaconIdentity {
     fn default() -> BeaconIdentity {
-        BeaconIdentity::new(BEACON_NAME, 9900)
+        BeaconIdentity::new(BEACON_NAME, 9900, beacon_tags(&[Variant::Underground2]))
     }
+}
+
+/// The tags the served games' LAN browsers list, each with its game.
+fn beacon_tags(games: &[Variant]) -> Vec<(&'static str, Variant)> {
+    let mut tags = Vec::new();
+    for &game in games {
+        let game_tags: &[&str] = match game {
+            Variant::Underground2 => &BEACON_TAGS,
+            Variant::MostWanted => &BEACON_TAGS_MW,
+        };
+        tags.extend(game_tags.iter().map(|&tag| (tag, game)));
+    }
+    tags
 }
 
 pub(crate) fn build_beacon(tag: &str, identity: &BeaconIdentity, player_count: u32) -> [u8; BEACON_LEN] {
@@ -116,9 +136,8 @@ pub(crate) fn run_beacon(targets: Vec<String>, identity: BeaconIdentity, log: Op
         Some(log) => record(log, peer, kind, data),
         None => println!("{} {} ({} bytes)", kind, peer, data.len()),
     };
-    let players = || lobby::PLAYERS_ONLINE.load(std::sync::atomic::Ordering::Relaxed);
-    let beacons = move |identity: &BeaconIdentity, count: u32| -> Vec<[u8; BEACON_LEN]> {
-        BEACON_TAGS.iter().map(|tag| build_beacon(tag, identity, count)).collect()
+    let beacons = |identity: &BeaconIdentity| -> Vec<[u8; BEACON_LEN]> {
+        identity.tags.iter().map(|&(tag, game)| build_beacon(tag, identity, lobby::players_online(game))).collect()
     };
     let peers: Arc<Mutex<HashMap<SocketAddr, Instant>>> = Arc::default();
     let socket = match UdpSocket::bind(("0.0.0.0", BEACON_PORT)) {
@@ -138,7 +157,7 @@ pub(crate) fn run_beacon(targets: Vec<String>, identity: BeaconIdentity, log: Op
                             None => println!("QUERY {}", who),
                         }
                         peers.lock().unwrap().insert(peer, Instant::now());
-                        for pkt in &beacons(&identity, players()) {
+                        for pkt in &beacons(&identity) {
                             let _ = responder.send_to(pkt, peer);
                         }
                     }
@@ -158,7 +177,8 @@ pub(crate) fn run_beacon(targets: Vec<String>, identity: BeaconIdentity, log: Op
         BEACON_INTERVAL_SECS,
         targets.join(", ")
     );
-    let mut advertised: Option<u32> = None;
+    // The racer count last advertised per tag.
+    let mut advertised: HashMap<&str, u32> = HashMap::new();
     loop {
         let recent: Vec<String> = {
             let mut peers = peers.lock().unwrap();
@@ -166,13 +186,15 @@ pub(crate) fn run_beacon(targets: Vec<String>, identity: BeaconIdentity, log: Op
             peers.keys().map(|p| p.to_string()).collect()
         };
         let destinations: Vec<&String> = targets.iter().chain(recent.iter()).collect();
-        let count = players();
         let mut packets = Vec::new();
-        if let Some(old) = advertised.filter(|old| *old != count) {
-            packets.extend(beacons(&identity, old).into_iter().map(withdrawal));
+        for &(tag, game) in &identity.tags {
+            let count = lobby::players_online(game);
+            if let Some(&old) = advertised.get(tag).filter(|old| **old != count) {
+                packets.push(withdrawal(build_beacon(tag, &identity, old)));
+            }
+            packets.push(build_beacon(tag, &identity, count));
+            advertised.insert(tag, count);
         }
-        packets.extend(beacons(&identity, count));
-        advertised = Some(count);
         for target in destinations {
             for pkt in &packets {
                 if let Err(e) = socket.send_to(pkt, target.as_str()) {
@@ -206,7 +228,12 @@ mod tests {
 
     #[test]
     fn beacon_fields_are_at_expected_offsets() {
-        let identity = BeaconIdentity { name: BEACON_NAME.to_string(), id: 0x1234_5678, game_port: 9900 };
+        let identity = BeaconIdentity {
+            name: BEACON_NAME.to_string(),
+            id: 0x1234_5678,
+            game_port: 9900,
+            tags: beacon_tags(&[Variant::Underground2]),
+        };
         let pkt = build_beacon("NFSU2NA", &identity, 3);
         assert_eq!(&pkt[4..8], &0x1234_5678u32.to_le_bytes());
         assert_eq!(&pkt[..3], &[0x67, 0x45, 0x41]);
@@ -216,6 +243,17 @@ mod tests {
         assert_eq!(&pkt[0x28..0x28 + BEACON_NAME.len()], BEACON_NAME.as_bytes());
         assert_eq!(&pkt[0x48..0x48 + 6], b"9900|3");
         assert_eq!(&pkt[0x108..0x108 + BEACON_NETWORKS.len()], BEACON_NETWORKS.as_bytes());
+    }
+
+    #[test]
+    fn each_game_gets_beacons_with_its_own_tags() {
+        let (u2, mw) = (Variant::Underground2, Variant::MostWanted);
+        assert_eq!(beacon_tags(&[u2]), [("NFSU2NA", u2), ("NFSU2", u2)]);
+        assert_eq!(beacon_tags(&[mw]), [("NFSMWNA", mw), ("NFSMW", mw)]);
+        assert_eq!(beacon_tags(&[u2, mw]).len(), 4);
+        let identity = BeaconIdentity::new("Garage", 9900, beacon_tags(&[mw]));
+        let pkt = build_beacon(identity.tags[0].0, &identity, 0);
+        assert_eq!(&pkt[0x08..0x08 + 8], b"NFSMWNA\0");
     }
 
     #[test]
@@ -238,6 +276,12 @@ mod tests {
 
 /// The traffic log; `None` when debug_mode is off, which turns `record` off.
 pub(crate) type Log = Arc<Mutex<Option<File>>>;
+
+/// A log that records nothing, for tests.
+#[cfg(test)]
+pub(crate) fn test_log() -> Log {
+    Arc::new(Mutex::new(None))
+}
 
 fn now_millis() -> u128 {
     SystemTime::now()
@@ -307,10 +351,10 @@ fn listen_tcp(port: u16, log: Log) -> std::io::Result<()> {
 }
 
 fn main() -> std::io::Result<()> {
-    // Usage: nfsu2-server [config.ini]   (default: nfsu2-server.ini)
+    // Usage: nfs-lan-server [config.ini]   (default: nfs-lan-server.ini)
     let args: Vec<String> = env::args().skip(1).collect();
     if args.len() > 1 {
-        eprintln!("usage: nfsu2-server [config.ini]");
+        eprintln!("usage: nfs-lan-server [config.ini]");
         std::process::exit(2);
     }
     let path = args.first().map(String::as_str).unwrap_or(config::DEFAULT_PATH);
@@ -321,8 +365,8 @@ fn main() -> std::io::Result<()> {
             std::process::exit(2);
         }
     };
-    println!("config {}: filter {:?}, debug_mode {}", path, config.filter, config.debug_mode);
-    let identity = BeaconIdentity::new(&config.name, REDIRECT_PORT);
+    println!("config {}: games {:?}, filter {:?}, debug_mode {}", path, config.games, config.filter, config.debug_mode);
+    let identity = BeaconIdentity::new(&config.name, REDIRECT_PORT, beacon_tags(&config.games));
 
     let log: Log = Arc::new(Mutex::new(None));
     if config.debug_mode {
@@ -332,7 +376,7 @@ fn main() -> std::io::Result<()> {
         println!("logging to {}", path);
     }
 
-    lobby::spawn(Arc::clone(&log), config.filter, REDIRECT_PORT, LOBBY_PORT);
+    lobby::spawn(Arc::clone(&log), config.filter, &config.games, REDIRECT_PORT, LOBBY_PORT);
     let mut handles = Vec::new();
     if config.debug_mode {
         for &port in DEBUG_TCP_PORTS {

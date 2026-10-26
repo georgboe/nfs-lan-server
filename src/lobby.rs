@@ -8,9 +8,14 @@
 //!
 //! Values are bytes. Incoming ones are decoded as SPEED2.EXE's FUN_00742360
 //! does: an optional surrounding quote and `%xx` escapes. Outgoing values are
-//! written raw (dates, spaces, colons and non-ASCII bytes as they are, which
-//! the client's date parser and decoder require) with only the bytes that
-//! would break parsing escaped: control characters, `%` and a leading `"`.
+//! encoded for the recipient's game: Underground 2's are written raw (dates,
+//! spaces, colons and non-ASCII bytes as they are, which the client's date
+//! parser and decoder require) with only the bytes that would break parsing
+//! escaped: control characters, `%` and a leading `"`. Most Wanted's follow
+//! its server.dll (`encode_value_mw`).
+//!
+//! The server can serve both games at once: each game gets its own `Lobby`
+//! and a client moves to its game's lobby when it logs in (see `Shared`).
 //! Bytes that aren't valid UTF-8 are kept in strings as U+F780..U+F7FF and
 //! written back as the original byte, so text relays byte for byte.
 //!
@@ -31,7 +36,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::games::{ClientId, Filter, Lobby, Outgoing};
+use crate::games::{ClientId, Filter, Lobby, Outgoing, Variant};
 use crate::{record, Log};
 
 const HEADER_LEN: usize = 12;
@@ -51,8 +56,13 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 static NEXT_SESSION: AtomicU32 = AtomicU32::new(1_000_000);
 
-/// Logged-in players, read by the LAN beacon for its racer count.
-pub(crate) static PLAYERS_ONLINE: AtomicU32 = AtomicU32::new(0);
+/// Logged-in players per game (`Variant::index`), read by the LAN beacon for
+/// each game's racer count.
+static PLAYERS_ONLINE: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
+
+pub(crate) fn players_online(variant: Variant) -> u32 {
+    PLAYERS_ONLINE[variant.index()].load(Ordering::Relaxed)
+}
 
 /// Where bytes that aren't valid UTF-8 live inside a `String`.
 const RAW_BYTE_BASE: u32 = 0xF700;
@@ -81,7 +91,15 @@ fn string_to_bytes(value: &str) -> Vec<u8> {
     out
 }
 
-fn encode_value(value: &str) -> Vec<u8> {
+fn encode_value(variant: Variant, value: &str) -> Vec<u8> {
+    match variant {
+        Variant::Underground2 => encode_value_u2(value),
+        Variant::MostWanted => encode_value_mw(value),
+    }
+}
+
+/// Underground 2: raw except what would break parsing.
+fn encode_value_u2(value: &str) -> Vec<u8> {
     let mut out = Vec::new();
     for (i, b) in string_to_bytes(value).into_iter().enumerate() {
         if b < 0x20 || b == 0x7f || b == b'%' || (i == 0 && b == b'"') {
@@ -89,6 +107,30 @@ fn encode_value(value: &str) -> Vec<u8> {
         } else {
             out.push(b);
         }
+    }
+    out
+}
+
+/// Most Wanted, like its server.dll's writer (FUN_10003cf0, table at
+/// 0x1004d338): control bytes, `"`, `%`, `=` and DEL become `%xx`, and a
+/// value containing a space or comma is quoted. A raw `=` inside a value
+/// garbles nested PARAMS such as `V=..%0aE=..` in the game room.
+fn encode_value_mw(value: &str) -> Vec<u8> {
+    let bytes = string_to_bytes(value);
+    let quoted = bytes.iter().any(|&b| b == b' ' || b == b',');
+    let mut out = Vec::new();
+    if quoted {
+        out.push(b'"');
+    }
+    for b in bytes {
+        if b < 0x20 || b == 0x7f || b == b'%' || b == b'"' || b == b'=' {
+            out.extend_from_slice(format!("%{:02x}", b).as_bytes());
+        } else {
+            out.push(b);
+        }
+    }
+    if quoted {
+        out.push(b'"');
     }
     out
 }
@@ -155,12 +197,18 @@ impl Message {
     }
 }
 
+/// A message with Underground 2's value encoding.
 pub(crate) fn encode(command: &[u8; 4], status: &[u8; 4], fields: &[(&str, String)]) -> Vec<u8> {
+    encode_for(Variant::Underground2, command, status, fields)
+}
+
+/// A message with `variant`'s value encoding (see `encode_value_mw`).
+pub(crate) fn encode_for(variant: Variant, command: &[u8; 4], status: &[u8; 4], fields: &[(&str, String)]) -> Vec<u8> {
     let mut body = Vec::new();
     for (key, value) in fields {
         body.extend_from_slice(key.as_bytes());
         body.push(b'=');
-        body.extend_from_slice(&encode_value(value));
+        body.extend_from_slice(&encode_value(variant, value));
         body.push(b'\n');
     }
     let len = HEADER_LEN + body.len() + 1;
@@ -290,31 +338,47 @@ fn redirect_reply(msg: &Message, lobby: SocketAddr) -> Vec<Vec<u8>> {
 
 /// `persona` is the name the server assigned this client (see
 /// `Lobby::claim_persona`); `auth` and `pers` answer with it.
-fn lobby_reply(msg: &Message, peer: SocketAddr, persona: &str) -> Vec<Vec<u8>> {
+/// What the server knows about the client's own addresses.
+#[derive(Default)]
+struct SelfAddr<'a> {
+    /// Address the client reported in `addr`.
+    local: &'a str,
+    /// Machine address (MAC) from `auth`.
+    mac: &'a str,
+}
+
+fn lobby_reply(msg: &Message, peer: SocketAddr, persona: &str, variant: Variant, self_addr: &SelfAddr) -> Vec<Vec<u8>> {
     let ok = [0u8; 4];
     match &msg.command {
         b"addr" => vec![Vec::new()],
-        b"skey" => vec![encode(b"skey", &ok, &[("SKEY", SESSION_KEY.to_string())])],
-        b"news" => vec![encode(b"news", b"new0", &[])],
+        b"skey" => vec![encode_for(variant, b"skey", &ok, &[("SKEY", SESSION_KEY.to_string())])],
+        b"news" => vec![encode_for(variant, b"news", b"new0", &[])],
         b"~png" => vec![Vec::new()],
         // Fields read back in SPEED2.EXE FUN_00745540: MORE, SLOTS, STATS.
-        b"sele" => vec![encode(
-            b"sele",
-            &ok,
-            &[
+        b"sele" => {
+            let mut fields = vec![
                 ("MORE", "0".to_string()),
                 ("SLOTS", "4".to_string()),
                 ("STATS", msg.get("STATS").unwrap_or_else(|| "0".to_string())),
                 ("MYGAME", msg.get("MYGAME").unwrap_or_else(|| "1".to_string())),
                 ("ASYNC", msg.get("ASYNC").unwrap_or_else(|| "1".to_string())),
                 ("MESGS", msg.get("MESGS").unwrap_or_else(|| "1".to_string())),
-            ],
-        )],
+            ];
+            // Most Wanted also asks for rooms and usersets; echo what it asked for.
+            if variant == Variant::MostWanted {
+                for key in ["ROOMS", "USERSETS"] {
+                    if let Some(value) = msg.get(key) {
+                        fields.push((key, value));
+                    }
+                }
+            }
+            vec![encode_for(variant, b"sele", &ok, &fields)]
+        }
         // On a LAN server any name logs in; the account backend in server.dll
         // (FUN_10005110) answers with the name as the only persona.
         b"auth" => {
             let name = persona.to_string();
-            vec![encode(
+            vec![encode_for(variant, 
                 b"auth",
                 &ok,
                 &[
@@ -337,29 +401,81 @@ fn lobby_reply(msg: &Message, peer: SocketAddr, persona: &str) -> Vec<Vec<u8>> {
         // PERS is read back in SPEED2.EXE FUN_00745540.
         b"pers" => {
             let pers = persona.to_string();
-            vec![encode(
-                b"pers",
-                &ok,
-                &[
-                    ("PERS", pers.clone()),
-                    ("NAME", pers),
-                    ("LKEY", SESSION_KEY.trim_start_matches('$').to_string()),
-                    ("LAST", "2005.1.1 00:00:00".to_string()),
-                ],
-            )]
+            let mut fields = vec![
+                ("PERS", pers.clone()),
+                ("NAME", pers),
+                ("LKEY", SESSION_KEY.trim_start_matches('$').to_string()),
+                ("LAST", "2005.1.1 00:00:00".to_string()),
+            ];
+            // Most Wanted takes its own public, local and machine address from
+            // here (speed.exe FUN_00845a40) and hands them to its peer
+            // connection setup; without them nobody ever connects.
+            if variant == Variant::MostWanted {
+                let local = if self_addr.local.is_empty() { peer.ip().to_string() } else { self_addr.local.to_string() };
+                fields.push(("A", peer.ip().to_string()));
+                fields.push(("LA", local));
+                fields.push(("MA", msg.get("MAC").unwrap_or_else(|| self_addr.mac.to_string())));
+            }
+            vec![encode_for(variant, b"pers", &ok, &fields)]
         }
         _ => Vec::new(),
     }
 }
 
-/// Lobby state plus a send queue for every connected client, so one
-/// client's request can push messages to others without blocking on them.
+/// One lobby per game served plus a send queue for every connected client,
+/// so one client's request can push messages to others without blocking on
+/// them. The lobbies never share players, games, chat or stats.
 struct Shared {
-    lobby: Lobby,
+    lobbies: Vec<Lobby>,
+    /// Index into `lobbies` of each connected client's lobby. A client starts
+    /// in the first and moves to its game's lobby at `auth`.
+    homes: HashMap<ClientId, usize>,
     writers: HashMap<ClientId, Sender<Vec<u8>>>,
+    /// Client ids are unique across lobbies, since writers are keyed by them.
+    next_client: ClientId,
 }
 
 impl Shared {
+    fn new(filter: Filter, games: &[Variant]) -> Shared {
+        let lobbies = games.iter().map(|&game| Lobby::new(filter).with_variant(game)).collect();
+        Shared { lobbies, homes: HashMap::new(), writers: HashMap::new(), next_client: 0 }
+    }
+
+    fn connect(&mut self, addr: String) -> ClientId {
+        self.next_client += 1;
+        let id = self.next_client;
+        self.lobbies[0].join_as(id, addr);
+        self.homes.insert(id, 0);
+        id
+    }
+
+    fn disconnect(&mut self, id: ClientId) -> Vec<Outgoing> {
+        self.writers.remove(&id);
+        match self.homes.remove(&id) {
+            Some(home) => self.lobbies[home].leave(id),
+            None => Vec::new(),
+        }
+    }
+
+    fn lobby(&mut self, id: ClientId) -> &mut Lobby {
+        let home = self.homes.get(&id).copied().unwrap_or(0);
+        &mut self.lobbies[home]
+    }
+
+    /// Moves a client that is logging in to the lobby of the game it says it
+    /// is (PROD), when this server has one; otherwise it stays where it is.
+    fn assign(&mut self, id: ClientId, msg: &Message) {
+        let Some(game) = msg.get("PROD").and_then(|prod| Variant::from_product(&prod)) else { return };
+        let Some(target) = self.lobbies.iter().position(|l| l.variant() == game) else { return };
+        let home = self.homes.get(&id).copied().unwrap_or(0);
+        if target != home {
+            if let Some(player) = self.lobbies[home].hand_over(id) {
+                self.lobbies[target].take_over(id, player);
+                self.homes.insert(id, target);
+            }
+        }
+    }
+
     fn deliver(&self, out: Vec<Outgoing>) {
         for Outgoing { to, data } in out {
             if let Some(writer) = self.writers.get(&to) {
@@ -370,12 +486,15 @@ impl Shared {
     }
 }
 
-/// Sends changed stats to the clients that want them and publishes the
-/// racer count for the beacon.
+/// Sends changed stats to the clients that want them and publishes each
+/// game's racer count for the beacon.
 fn flush_stats(shared: &mut Shared) {
-    let out = shared.lobby.stats_updates();
-    shared.deliver(out);
-    PLAYERS_ONLINE.store(shared.lobby.players_online(), Ordering::Relaxed);
+    for i in 0..shared.lobbies.len() {
+        let out = shared.lobbies[i].stats_updates();
+        shared.deliver(out);
+        let lobby = &shared.lobbies[i];
+        PLAYERS_ONLINE[lobby.variant().index()].store(lobby.players_online(), Ordering::Relaxed);
+    }
 }
 
 /// Answers one lobby request from `id`.
@@ -384,40 +503,53 @@ fn handle_lobby(shared: &mut Shared, id: ClientId, peer: SocketAddr, msg: &Messa
 }
 
 fn answer_lobby(shared: &mut Shared, id: ClientId, peer: SocketAddr, msg: &Message, log: &Log, who: &str) {
+    if &msg.command == b"auth" {
+        shared.assign(id, msg);
+    }
     let requested = match &msg.command {
         b"auth" => msg.get("NAME"),
         b"pers" => msg.get("PERS"),
         _ => None,
     };
     let persona = match requested {
-        Some(name) => shared.lobby.claim_persona(id, &name),
+        Some(name) => shared.lobby(id).claim_persona(id, &name),
         None => String::new(),
     };
     match &msg.command {
         b"addr" => {
-            if let Some(player) = shared.lobby.player_mut(id) {
+            if let Some(player) = shared.lobby(id).player_mut(id) {
                 player.local_addr = msg.get("ADDR").unwrap_or_default();
             }
         }
-        b"sele" => shared.lobby.select(id, msg),
         _ => {}
     }
-    let answers = lobby_reply(msg, peer, &persona);
+    // Userset subscriptions in `sele` push member lists, which follow the reply.
+    let pushes = if &msg.command == b"sele" { shared.lobby(id).select(id, msg) } else { Vec::new() };
+    if let (b"auth" | b"pers", Some(mac)) = (&msg.command, msg.get("MAC")) {
+        if let Some(player) = shared.lobby(id).player_mut(id) {
+            player.mac = mac;
+        }
+    }
+    let (local, mac) = shared.lobby(id).player_mut(id).map(|p| (p.local_addr.clone(), p.mac.clone())).unwrap_or_default();
+    let self_addr = SelfAddr { local: &local, mac: &mac };
+    let answers = lobby_reply(msg, peer, &persona, shared.lobby(id).variant(), &self_addr);
     if !answers.is_empty() {
         let mut out: Vec<Outgoing> = answers.into_iter().map(|data| Outgoing { to: id, data }).collect();
         // Login is complete once the persona is chosen: tell the client who it is.
         if &msg.command == b"pers" {
-            out.extend(shared.lobby.who(id));
+            out.extend(shared.lobby(id).who(id));
         }
+        out.extend(pushes);
         shared.deliver(out);
         return;
     }
-    if let Some(out) = shared.lobby.handle(id, msg) {
+    if let Some(out) = shared.lobby(id).handle(id, msg) {
         shared.deliver(out);
         return;
     }
     record(log, who, &format!("GENERIC {}", msg.name()), &[]);
-    shared.deliver(vec![Outgoing { to: id, data: encode(&msg.command, &[0; 4], &[]) }]);
+    let data = encode_for(shared.lobby(id).variant(), &msg.command, &[0; 4], &[]);
+    shared.deliver(vec![Outgoing { to: id, data }]);
 }
 
 fn serve_lobby(mut stream: TcpStream, who: String, log: Log, shared: Arc<Mutex<Shared>>) {
@@ -428,7 +560,7 @@ fn serve_lobby(mut stream: TcpStream, who: String, log: Log, shared: Arc<Mutex<S
     record(&log, &who, "CONNECT", &[]);
     let id = {
         let mut shared = shared.lock().unwrap();
-        let id = shared.lobby.join(peer.ip().to_string());
+        let id = shared.connect(peer.ip().to_string());
         shared.writers.insert(id, spawn_writer(writer, who.clone(), log.clone()));
         id
     };
@@ -467,8 +599,7 @@ fn serve_lobby(mut stream: TcpStream, who: String, log: Log, shared: Arc<Mutex<S
         }
     }
     let mut shared = shared.lock().unwrap();
-    shared.writers.remove(&id);
-    let out = shared.lobby.leave(id);
+    let out = shared.disconnect(id);
     shared.deliver(out);
 }
 
@@ -494,7 +625,7 @@ where
 }
 
 /// Starts the redirector on `redirect_port` and the lobby on `lobby_port`.
-pub(crate) fn spawn(log: Log, filter: Filter, redirect_port: u16, lobby_port: u16) {
+pub(crate) fn spawn(log: Log, filter: Filter, games: &[Variant], redirect_port: u16, lobby_port: u16) {
     let redirect_log = log.clone();
     thread::spawn(move || {
         let result = listen(redirect_port, "redir", redirect_log, move |stream, who, log| {
@@ -510,14 +641,23 @@ pub(crate) fn spawn(log: Log, filter: Filter, redirect_port: u16, lobby_port: u1
             eprintln!("redir :{} failed: {}", redirect_port, e);
         }
     });
-    let shared = Arc::new(Mutex::new(Shared { lobby: Lobby::new(filter), writers: HashMap::new() }));
+    let shared = Arc::new(Mutex::new(Shared::new(filter, games)));
     let pinged = Arc::clone(&shared);
     thread::spawn(move || loop {
         thread::sleep(PING_INTERVAL);
         let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-        let ping = encode(b"~png", &[0; 4], &[("REF", utc_date(now))]);
+        // REF has a space, which Most Wanted's encoding quotes.
+        let pings: Vec<Vec<u8>> =
+            Variant::ALL.iter().map(|&game| encode_for(game, b"~png", &[0; 4], &[("REF", utc_date(now))])).collect();
         let shared = pinged.lock().unwrap();
-        let out = shared.writers.keys().map(|&to| Outgoing { to, data: ping.clone() }).collect();
+        let out = shared
+            .writers
+            .keys()
+            .map(|&to| {
+                let home = shared.homes.get(&to).copied().unwrap_or(0);
+                Outgoing { to, data: pings[shared.lobbies[home].variant().index()].clone() }
+            })
+            .collect();
         shared.deliver(out);
     });
     let counted = Arc::clone(&shared);
@@ -570,13 +710,24 @@ mod tests {
         assert_eq!(decode_value(b"\"John Doe\""), "John Doe");
         assert_eq!(decode_value(b"100%%"), "100%");
         // Output stays raw except what would break parsing.
-        assert_eq!(encode_value("John Doe"), b"John Doe");
-        assert_eq!(encode_value("TRACK=4011\nDIR=0"), b"TRACK=4011%0aDIR=0");
-        assert_eq!(encode_value("\"quoted\" 50%"), b"%22quoted\" 50%25");
+        assert_eq!(encode_value_u2("John Doe"), b"John Doe");
+        assert_eq!(encode_value_u2("TRACK=4011\nDIR=0"), b"TRACK=4011%0aDIR=0");
+        assert_eq!(encode_value_u2("\"quoted\" 50%"), b"%22quoted\" 50%25");
         let round_trip = "a \"b\": 50% ^=\n";
-        assert_eq!(decode_value(&encode_value(round_trip)), round_trip);
+        assert_eq!(decode_value(&encode_value_u2(round_trip)), round_trip);
         // Bytes that aren't UTF-8 survive a decode/encode round trip.
-        assert_eq!(encode_value(&decode_value(b"caf%e9")), b"caf\xe9");
+        assert_eq!(encode_value_u2(&decode_value(b"caf%e9")), b"caf\xe9");
+    }
+
+    #[test]
+    fn most_wanted_values_are_escaped_like_its_server() {
+        // The game's own PARAMS encoding comes back unchanged.
+        let params = "V%3d192359%0aP%3d%0aE%3d-1192261533%0a";
+        assert_eq!(encode_value_mw(&decode_value(params.as_bytes())), params.as_bytes());
+        assert_eq!(encode_value_mw("John Doe"), b"\"John Doe\"");
+        assert_eq!(encode_value_mw("a,b"), b"\"a,b\"");
+        let round_trip = "a \"b\": 50% ^=\n";
+        assert_eq!(decode_value(&encode_value_mw(round_trip)), round_trip);
     }
 
     #[test]
@@ -592,12 +743,12 @@ mod tests {
 
     #[test]
     fn flush_sends_changed_stats_once_and_publishes_the_racer_count() {
-        let mut shared = Shared { lobby: Lobby::new(Filter::Off), writers: HashMap::new() };
-        let id = shared.lobby.join("192.168.1.100".into());
+        let mut shared = Shared::new(Filter::Off, &[Variant::Underground2]);
+        let id = shared.connect("192.168.1.100".into());
         let (tx, rx) = mpsc::channel();
         shared.writers.insert(id, tx);
-        shared.lobby.claim_persona(id, "racer");
-        shared.lobby.select(id, &Message { command: *b"sele", body: b"STATS=1\0".to_vec() });
+        shared.lobby(id).claim_persona(id, "racer");
+        shared.lobby(id).select(id, &Message { command: *b"sele", body: b"STATS=1\0".to_vec() });
         assert!(rx.try_recv().is_err(), "nothing is sent until the flush");
 
         flush_stats(&mut shared);
@@ -606,7 +757,7 @@ mod tests {
         let msg = decode(&mut stats.remove(0)).unwrap();
         assert_eq!(&msg.command, b"+sst");
         assert_eq!(msg.get("UIL").as_deref(), Some("1"));
-        assert_eq!(PLAYERS_ONLINE.load(Ordering::Relaxed), 1);
+        assert_eq!(players_online(Variant::Underground2), 1);
 
         flush_stats(&mut shared);
         assert!(rx.try_recv().is_err(), "unchanged stats aren't resent");
@@ -622,11 +773,104 @@ mod tests {
     fn auth_logs_in_any_name_with_it_as_persona() {
         let peer: SocketAddr = "192.168.1.109:36764".parse().unwrap();
         let request = Message { command: *b"auth", body: b"NAME=NAME\nPASS=\"x\"\n\0".to_vec() };
-        let mut reply = lobby_reply(&request, peer, "NAME").remove(0);
+        let mut reply = lobby_reply(&request, peer, "NAME", Variant::Underground2, &SelfAddr::default()).remove(0);
         let msg = decode(&mut reply).unwrap();
         assert_eq!(&msg.command, b"auth");
         assert_eq!(msg.get("NAME").as_deref(), Some("NAME"));
         assert_eq!(msg.get("PERSONAS").as_deref(), Some("NAME"));
         assert_eq!(msg.get("ADDR").as_deref(), Some("192.168.1.109"));
+    }
+
+    #[test]
+    fn only_most_wanted_gets_rooms_and_usersets_echoed() {
+        let peer: SocketAddr = "192.168.1.109:36764".parse().unwrap();
+        let request = Message { command: *b"sele", body: b"MYGAME=1\nROOMS=1\nUSERSETS=1\n\0".to_vec() };
+        let sele = |variant| decode(&mut lobby_reply(&request, peer, "NAME", variant, &SelfAddr::default()).remove(0)).unwrap();
+        assert_eq!(sele(Variant::MostWanted).get("USERSETS").as_deref(), Some("1"));
+        assert_eq!(sele(Variant::MostWanted).get("ROOMS").as_deref(), Some("1"));
+        assert_eq!(sele(Variant::Underground2).get("USERSETS"), None);
+        assert_eq!(sele(Variant::Underground2).get("ROOMS"), None);
+    }
+
+    #[test]
+    fn most_wanted_pers_reply_carries_the_clients_addresses() {
+        let peer: SocketAddr = "192.168.1.109:36764".parse().unwrap();
+        let request = Message { command: *b"pers", body: b"PERS=NAM\nMAC=$40554833fae6\n\0".to_vec() };
+        let addrs = SelfAddr { local: "10.0.0.5", mac: "" };
+        let pers = |variant| decode(&mut lobby_reply(&request, peer, "NAM", variant, &addrs).remove(0)).unwrap();
+        let mw = pers(Variant::MostWanted);
+        assert_eq!(mw.get("A").as_deref(), Some("192.168.1.109"));
+        assert_eq!(mw.get("LA").as_deref(), Some("10.0.0.5"));
+        assert_eq!(mw.get("MA").as_deref(), Some("$40554833fae6"));
+        assert_eq!(pers(Variant::Underground2).get("A"), None);
+    }
+
+    #[test]
+    fn login_mac_reaches_the_records_most_wanted_peers_use() {
+        let log = crate::test_log();
+        let mut shared = Shared::new(Filter::Off, &[Variant::MostWanted]);
+        let id = shared.connect("192.168.1.189".into());
+        let (tx, rx) = mpsc::channel();
+        shared.writers.insert(id, tx);
+        let peer: SocketAddr = "192.168.1.189:34956".parse().unwrap();
+        let send = |shared: &mut Shared, command: &[u8; 4], body: &str| {
+            let msg = Message { command: *command, body: format!("{}\0", body).into_bytes() };
+            answer_lobby(shared, id, peer, &msg, &log, "test");
+        };
+        send(&mut shared, b"addr", "ADDR=192.168.1.189\nPORT=34956");
+        send(&mut shared, b"pers", "PERS=pc\nMAC=$fc6d77d9498c");
+        // `addr` is answered with nothing (an empty frame).
+        let sent: Vec<Message> = rx.try_iter().filter_map(|mut data| decode(&mut data)).collect();
+        let pers = sent.iter().find(|m| &m.command == b"pers").unwrap();
+        let who = sent.iter().find(|m| &m.command == b"+who").unwrap();
+        for record in [pers, who] {
+            assert_eq!(record.get("LA").as_deref(), Some("192.168.1.189"));
+            assert_eq!(record.get("MA").as_deref(), Some("$fc6d77d9498c"));
+        }
+    }
+
+    #[test]
+    fn both_games_get_their_own_lobby() {
+        let log = crate::test_log();
+        let mut shared = Shared::new(Filter::Off, &Variant::ALL);
+        let mut inbox: HashMap<ClientId, mpsc::Receiver<Vec<u8>>> = HashMap::new();
+        let login = |shared: &mut Shared, inbox: &mut HashMap<ClientId, mpsc::Receiver<Vec<u8>>>, prod: &str, name: &str| {
+            let id = shared.connect("192.168.1.10".into());
+            let (tx, rx) = mpsc::channel();
+            shared.writers.insert(id, tx);
+            inbox.insert(id, rx);
+            let peer: SocketAddr = "192.168.1.10:1000".parse().unwrap();
+            let requests = [
+                (b"auth", format!("PROD={}\nNAME={}", prod, name)),
+                (b"pers", format!("PERS={}", name)),
+                (b"sele", "MESGS=1".to_string()),
+            ];
+            for (command, body) in requests {
+                let msg = Message { command: *command, body: format!("{}\0", body).into_bytes() };
+                answer_lobby(shared, id, peer, &msg, &log, "test");
+            }
+            id
+        };
+        let u2 = login(&mut shared, &mut inbox, "nfs-pc-2005", "under");
+        let mw = login(&mut shared, &mut inbox, "nfs-pc-2006", "wanted");
+        assert_eq!(shared.lobby(u2).variant(), Variant::Underground2);
+        assert_eq!(shared.lobby(mw).variant(), Variant::MostWanted);
+        // Each lobby only has its own player.
+        assert_eq!(shared.lobbies.iter().map(|l| l.players_online()).collect::<Vec<_>>(), [1, 1]);
+        // Replies use each game's encoding: Most Wanted quotes values with spaces.
+        let raw = |id: ClientId| inbox[&id].try_iter().collect::<Vec<_>>().concat();
+        let (u2_bytes, mw_bytes) = (raw(u2), raw(mw));
+        let has = |bytes: &[u8], text: &[u8]| bytes.windows(text.len()).any(|w| w == text);
+        assert!(has(&u2_bytes, b"LAST=2005.1.1 00:00:00"));
+        assert!(has(&mw_bytes, b"LAST=\"2005.1.1 00:00:00\""));
+        // Lobby chat stays in its game.
+        let peer: SocketAddr = "192.168.1.10:1000".parse().unwrap();
+        let chat = Message { command: *b"mesg", body: b"TEXT=hello\0".to_vec() };
+        answer_lobby(&mut shared, mw, peer, &chat, &log, "test");
+        assert!(inbox[&u2].try_iter().all(|mut m| decode(&mut m).map_or(true, |m| &m.command != b"+msg")));
+        assert!(inbox[&mw].try_iter().any(|mut m| decode(&mut m).is_some_and(|m| &m.command == b"+msg")));
+        // A client with an unknown PROD stays in the first lobby.
+        let other = login(&mut shared, &mut inbox, "something-else", "other");
+        assert_eq!(shared.lobby(other).variant(), Variant::Underground2);
     }
 }

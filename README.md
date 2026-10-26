@@ -1,8 +1,10 @@
-# nfsu2-server
+# nfs-lan-server
 
-A dedicated LAN server for **Need for Speed: Underground 2** (PC, v1.2), written in Rust
-with no dependencies. The game finds it in the LAN browser, logs in, and players can chat, create and
-join games, and race each other.
+A dedicated LAN server for **Need for Speed: Underground 2** (PC, v1.2) and
+**Need for Speed: Most Wanted** (PC, v1.3), written in Rust with no
+dependencies. The game finds it in the LAN browser, logs in, and players can
+chat, create and join games, and race each other. One server can serve both
+games at once, each in its own lobby.
 
 ## Building
 
@@ -12,7 +14,7 @@ Requires a Rust toolchain (edition 2024).
 cargo build --release
 ```
 
-The binary is `target/release/nfsu2-server`.
+The binary is `target/release/nfs-lan-server`.
 
 ### Static builds
 
@@ -24,7 +26,7 @@ Linux (x86_64, musl):
 ```sh
 rustup target add x86_64-unknown-linux-musl
 cargo build --release --target x86_64-unknown-linux-musl
-# -> target/x86_64-unknown-linux-musl/release/nfsu2-server
+# -> target/x86_64-unknown-linux-musl/release/nfs-lan-server
 ```
 
 Windows (x86_64), cross-compiled with MinGW (`x86_64-w64-mingw32-gcc`):
@@ -32,7 +34,7 @@ Windows (x86_64), cross-compiled with MinGW (`x86_64-w64-mingw32-gcc`):
 ```sh
 rustup target add x86_64-pc-windows-gnu
 RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --target x86_64-pc-windows-gnu
-# -> target/x86_64-pc-windows-gnu/release/nfsu2-server.exe
+# -> target/x86_64-pc-windows-gnu/release/nfs-lan-server.exe
 ```
 
 The Windows build only uses DLLs that ship with Windows.
@@ -46,8 +48,8 @@ cargo test
 ## Running
 
 ```sh
-nfsu2-server              # reads nfsu2-server.ini in the current folder
-nfsu2-server my.ini       # or a config file of your choice
+nfs-lan-server            # reads nfs-lan-server.ini in the current folder
+nfs-lan-server my.ini     # or a config file of your choice
 ```
 
 If the config file doesn't exist, the server writes one with the defaults.
@@ -60,11 +62,16 @@ hides LAN servers that run on its own machine.
 
 ## Configuration
 
-`nfsu2-server.ini` (see `nfsu2-server.example.ini`):
+`nfs-lan-server.ini` (see `nfs-lan-server.example.ini`):
 
 ```ini
+; Which game the server is for: u2 (Underground 2), mw (Most Wanted) or
+; both. With both, each game lists the server and its players get their own
+; lobby: games, chat and stats never mix.
+game = both
+
 ; Name in the game's LAN browser, 1 to 12 bytes.
-name = NFSU2 Server
+name = NFS LAN
 
 ; Which games the join screen lists:
 ;   ea   = like EA's server: race mode, car matching and options must match
@@ -77,6 +84,11 @@ filter = off
 debug_mode = false
 ```
 
+- **game** – `u2`, `mw` or `both`. With `both` the server advertises itself
+  to both games and puts each client in its own game's lobby, decided by the
+  product the game reports at login (`nfs-pc-2005` is Underground 2,
+  `nfs-pc-2006` is Most Wanted; anything else is treated as Underground 2).
+  The two lobbies share nothing but the ports.
 - **name** – the game only lists names of up to 12 bytes.
 - **filter** – which games the join screen lists. When you browse for games,
   the game sends the race type you picked and your race options, including

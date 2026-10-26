@@ -1,5 +1,5 @@
 /logs
 /redirect
 /target
-nfsu2-server.ini
+nfs-lan-server.ini
 /tools/stress/target

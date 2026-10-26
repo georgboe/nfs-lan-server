@@ -13,6 +13,10 @@ mod lobby;
 
 type Log = std::sync::Arc<std::sync::Mutex<std::fs::File>>;
 fn record(_: &Log, _: &str, _: &str, _: &[u8]) {}
+fn test_log() -> Log {
+    let path = std::env::temp_dir().join("nfs-lan-server-test.log");
+    std::sync::Arc::new(std::sync::Mutex::new(std::fs::File::create(path).unwrap()))
+}
 
 mod review {
     use super::{games::*, lobby::*};
